@@ -75,12 +75,14 @@ namespace FastLinkDirectTool
     {
         public bool AutoStart { get; set; }
         public bool AutoEnableWithFastLink { get; set; }
+        public bool DirectPrivateNetworks { get; set; }
         public List<string> Rules { get; set; }
 
         public AppConfig()
         {
             AutoStart = true;
             AutoEnableWithFastLink = true;
+            DirectPrivateNetworks = false;
             Rules = new List<string>();
         }
     }
@@ -483,6 +485,7 @@ namespace FastLinkDirectTool
     internal sealed class TrackedRoute
     {
         public string Address { get; set; }
+        public string Netmask { get; set; }
         public int InterfaceIndex { get; set; }
         public string Gateway { get; set; }
         public string LocalAddress { get; set; }
@@ -543,11 +546,57 @@ namespace FastLinkDirectTool
             }
         }
 
+        public bool EnsurePrivateNetworkRoutes()
+        {
+            lock (sync)
+            {
+                if (network == null) return false;
+                return EnsureNetworkRouteLocked("10.0.0.0", "255.0.0.0") &&
+                    EnsureNetworkRouteLocked("172.16.0.0", "255.240.0.0") &&
+                    EnsureNetworkRouteLocked("192.168.0.0", "255.255.0.0");
+            }
+        }
+
+        private bool EnsureNetworkRouteLocked(string destination, string netmask)
+        {
+            TrackedRoute tracked = state.Routes.FirstOrDefault(delegate(TrackedRoute route)
+            {
+                return string.Equals(route.Address, destination, StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(route.Netmask ?? "255.255.255.255", netmask, StringComparison.OrdinalIgnoreCase) &&
+                    route.InterfaceIndex == network.InterfaceIndex &&
+                    string.Equals(route.Gateway, network.Gateway.ToString(), StringComparison.OrdinalIgnoreCase);
+            });
+            if (tracked != null) return true;
+            if (HasPhysicalRoute(destination, netmask)) return true;
+
+            string arguments = string.Format(CultureInfo.InvariantCulture,
+                "ADD {0} MASK {1} {2} METRIC 1 IF {3}",
+                destination, netmask, network.Gateway, network.InterfaceIndex);
+            ProcessResult result = ProcessRunner.Run("route.exe", arguments, 10000);
+            if (result.ExitCode != 0 && !HasPhysicalRoute(destination, netmask)) return false;
+            if (result.ExitCode == 0)
+            {
+                state.Routes.Add(new TrackedRoute
+                {
+                    Address = destination,
+                    Netmask = netmask,
+                    InterfaceIndex = network.InterfaceIndex,
+                    Gateway = network.Gateway.ToString(),
+                    LocalAddress = network.LocalAddress.ToString(),
+                    ExpiresUtcTicks = 0,
+                    Infrastructure = true
+                });
+                SaveLocked();
+            }
+            return true;
+        }
+
         private bool EnsureRouteLocked(IPAddress address, long expiresTicks, bool infrastructure)
         {
             TrackedRoute tracked = state.Routes.FirstOrDefault(delegate(TrackedRoute route)
             {
                 return string.Equals(route.Address, address.ToString(), StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(route.Netmask ?? "255.255.255.255", "255.255.255.255", StringComparison.OrdinalIgnoreCase) &&
                     route.InterfaceIndex == network.InterfaceIndex &&
                     string.Equals(route.Gateway, network.Gateway.ToString(), StringComparison.OrdinalIgnoreCase);
             });
@@ -570,6 +619,7 @@ namespace FastLinkDirectTool
                 state.Routes.Add(new TrackedRoute
                 {
                     Address = address.ToString(),
+                    Netmask = "255.255.255.255",
                     InterfaceIndex = network.InterfaceIndex,
                     Gateway = network.Gateway.ToString(),
                     LocalAddress = network.LocalAddress.ToString(),
@@ -583,13 +633,18 @@ namespace FastLinkDirectTool
 
         private bool HasPhysicalHostRoute(IPAddress address)
         {
-            ProcessResult result = ProcessRunner.Run("route.exe", "PRINT -4 " + address, 5000);
+            return HasPhysicalRoute(address.ToString(), "255.255.255.255");
+        }
+
+        private bool HasPhysicalRoute(string destination, string netmask)
+        {
+            ProcessResult result = ProcessRunner.Run("route.exe", "PRINT -4 " + destination, 5000);
             if (result.ExitCode != 0) return false;
             string[] lines = result.Output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
             foreach (string line in lines)
             {
                 string[] parts = Regex.Split(line.Trim(), "\\s+");
-                if (parts.Length >= 5 && parts[0] == address.ToString() && parts[1] == "255.255.255.255" &&
+                if (parts.Length >= 5 && parts[0] == destination && parts[1] == netmask &&
                     parts[2] == network.Gateway.ToString() && parts[3] == network.LocalAddress.ToString())
                     return true;
             }
@@ -626,9 +681,10 @@ namespace FastLinkDirectTool
 
         private void DeleteRoute(TrackedRoute route)
         {
+            string netmask = string.IsNullOrWhiteSpace(route.Netmask) ? "255.255.255.255" : route.Netmask;
             string arguments = string.Format(CultureInfo.InvariantCulture,
-                "DELETE {0} MASK 255.255.255.255 {1} IF {2}",
-                route.Address, route.Gateway, route.InterfaceIndex);
+                "DELETE {0} MASK {1} {2} IF {3}",
+                route.Address, netmask, route.Gateway, route.InterfaceIndex);
             ProcessRunner.Run("route.exe", arguments, 10000);
         }
 
@@ -975,7 +1031,7 @@ namespace FastLinkDirectTool
             LegacyCleanup.Run();
         }
 
-        public void Enable(RuleSet rules)
+        public void Enable(RuleSet rules, bool directPrivateNetworks)
         {
             lock (sync)
             {
@@ -991,6 +1047,8 @@ namespace FastLinkDirectTool
                     if (!routes.EnsureRuleAddressRoute(address))
                         throw new InvalidOperationException("无法为 IP 地址 " + address + " 添加直连路由。");
                 }
+                if (directPrivateNetworks && !routes.EnsurePrivateNetworkRoutes())
+                    throw new InvalidOperationException("无法添加内网直连路由。");
                 try
                 {
                     proxy.Start(network, rules, routes);
@@ -1020,10 +1078,10 @@ namespace FastLinkDirectTool
             }
         }
 
-        public void Restart(RuleSet rules)
+        public void Restart(RuleSet rules, bool directPrivateNetworks)
         {
             Disable();
-            Enable(rules);
+            Enable(rules, directPrivateNetworks);
         }
 
         public void RemoveExpiredRoutes() { routes.RemoveExpired(); }
@@ -1157,6 +1215,7 @@ namespace FastLinkDirectTool
         private readonly CheckBox mainSwitch;
         private readonly CheckBox autoEnable;
         private readonly CheckBox autoStart;
+        private readonly CheckBox directPrivateNetworks;
         private readonly ListBox ruleList;
         private readonly TextBox ruleInput;
         private readonly TextBox logBox;
@@ -1183,7 +1242,7 @@ namespace FastLinkDirectTool
             root.ColumnCount = 1;
             root.RowCount = 5;
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 112));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 78));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 82));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 88));
@@ -1222,6 +1281,18 @@ namespace FastLinkDirectTool
                 ConfigStore.Save(config);
             };
             switchPanel.Controls.Add(autoEnable);
+            directPrivateNetworks = new CheckBox();
+            directPrivateNetworks.Text = "直连内网网段（邮箱/公司服务）";
+            directPrivateNetworks.AutoSize = true;
+            directPrivateNetworks.Padding = new Padding(12, 10, 0, 0);
+            directPrivateNetworks.Checked = config.DirectPrivateNetworks;
+            directPrivateNetworks.CheckedChanged += delegate
+            {
+                config.DirectPrivateNetworks = directPrivateNetworks.Checked;
+                ConfigStore.Save(config);
+                RestartForRuleChange();
+            };
+            switchPanel.Controls.Add(directPrivateNetworks);
             autoStart = new CheckBox();
             autoStart.Text = "Windows 登录后自启动";
             autoStart.AutoSize = true;
@@ -1405,7 +1476,7 @@ namespace FastLinkDirectTool
             busy = true;
             SafeLog(message);
             RuleSet rules = CurrentRules();
-            Task.Run(delegate { runtime.Enable(rules); }).ContinueWith(delegate(Task task)
+            Task.Run(delegate { runtime.Enable(rules, config.DirectPrivateNetworks); }).ContinueWith(delegate(Task task)
             {
                 BeginInvoke((Action)delegate
                 {
@@ -1447,7 +1518,7 @@ namespace FastLinkDirectTool
             busy = true;
             RuleSet rules = CurrentRules();
             SafeLog("规则已修改，正在刷新…");
-            Task.Run(delegate { runtime.Restart(rules); }).ContinueWith(delegate(Task task)
+            Task.Run(delegate { runtime.Restart(rules, config.DirectPrivateNetworks); }).ContinueWith(delegate(Task task)
             {
                 BeginInvoke((Action)delegate
                 {

@@ -97,8 +97,9 @@ $ErrorActionPreference = 'Stop'
 if ($headStatus -ne 0) { $hasHead = $false }
 $changes = git status --porcelain
 if (-not $hasHead -or $changes) {
+    $commitMessage = if ($hasHead) { 'Update FastLink Direct Tool' } else { 'Initial public release of FastLink Direct Tool' }
     $ErrorActionPreference = 'Continue'
-    git commit -m 'Initial public release of FastLink Direct Tool' 2>&1 | Out-Host
+    git commit -m $commitMessage 2>&1 | Out-Host
     $commitStatus = $LASTEXITCODE
     $ErrorActionPreference = 'Stop'
     if ($commitStatus -ne 0) { throw 'git commit failed.' }
@@ -110,20 +111,39 @@ $ErrorActionPreference = 'Continue'
 $repoExistsStatus = $LASTEXITCODE
 $ErrorActionPreference = 'Stop'
 if ($repoExistsStatus -eq 0) {
-    throw "GitHub repository $fullName already exists; upload stopped to avoid overwriting it."
-}
+    $expectedRemote = "https://github.com/$fullName.git"
+    $ErrorActionPreference = 'Continue'
+    $origin = git remote get-url origin 2>$null
+    $originStatus = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($originStatus -ne 0) {
+        git remote add origin $expectedRemote
+        if ($LASTEXITCODE -ne 0) { throw 'Could not add the GitHub remote.' }
+    }
+    elseif ($origin.TrimEnd('/') -ne $expectedRemote.TrimEnd('/')) {
+        throw "The existing origin remote does not match $expectedRemote."
+    }
 
-Write-Host '5/5  Creating the public repository and pushing...'
-$ErrorActionPreference = 'Continue'
-& $gh repo create $fullName `
-    --public `
-    --source $root `
-    --remote origin `
-    --push `
-    --description 'Windows split-routing helper that automatically follows FastLink tunnel state.' 2>&1 | Out-Host
-$publishStatus = $LASTEXITCODE
-$ErrorActionPreference = 'Stop'
-if ($publishStatus -ne 0) { throw 'GitHub repository creation or push failed.' }
+    Write-Host '5/5  Pushing the update to the public repository...'
+    $ErrorActionPreference = 'Continue'
+    git push -u origin main 2>&1 | Out-Host
+    $publishStatus = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($publishStatus -ne 0) { throw 'GitHub push failed.' }
+}
+else {
+    Write-Host '5/5  Creating the public repository and pushing...'
+    $ErrorActionPreference = 'Continue'
+    & $gh repo create $fullName `
+        --public `
+        --source $root `
+        --remote origin `
+        --push `
+        --description 'Windows split-routing helper that automatically follows FastLink tunnel state.' 2>&1 | Out-Host
+    $publishStatus = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($publishStatus -ne 0) { throw 'GitHub repository creation or push failed.' }
+}
 
 $url = "https://github.com/$fullName"
 $url | Set-Content -LiteralPath $resultFile -Encoding UTF8
