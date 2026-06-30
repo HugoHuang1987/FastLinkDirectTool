@@ -1,0 +1,9 @@
+build.log
+publish-result.txt
+publish.log
+.tools/
+*.new.exe
+*.tmp
+*.pdb
+obj/
+bin/
