@@ -1,6 +1,7 @@
 build.log
 publish-result.txt
 publish.log
+runtime.log*
 .tools/
 *.new.exe
 *.tmp

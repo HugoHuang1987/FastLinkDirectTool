@@ -159,16 +159,53 @@ namespace FastLinkDirectTool
             info.RedirectStandardOutput = true;
             info.RedirectStandardError = true;
 
-            using (Process process = Process.Start(info))
+            StringBuilder output = new StringBuilder();
+            StringBuilder error = new StringBuilder();
+            object outputSync = new object();
+            object errorSync = new object();
+            using (Process process = new Process())
             {
-                string output = process.StandardOutput.ReadToEnd();
-                string error = process.StandardError.ReadToEnd();
+                process.StartInfo = info;
+                process.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e)
+                {
+                    if (e.Data == null) return;
+                    lock (outputSync) output.AppendLine(e.Data);
+                };
+                process.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e)
+                {
+                    if (e.Data == null) return;
+                    lock (errorSync) error.AppendLine(e.Data);
+                };
+                process.Start();
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
                 if (!process.WaitForExit(timeoutMilliseconds))
                 {
                     try { process.Kill(); } catch { }
-                    return new ProcessResult { ExitCode = -1, Output = output, Error = "Operation timed out." };
+                    try { process.WaitForExit(2000); } catch { }
+                    AppLogger.Log("System command timed out: " + fileName);
+                    lock (outputSync)
+                    lock (errorSync)
+                    {
+                        return new ProcessResult
+                        {
+                            ExitCode = -1,
+                            Output = output.ToString(),
+                            Error = error.ToString() + "Operation timed out."
+                        };
+                    }
                 }
-                return new ProcessResult { ExitCode = process.ExitCode, Output = output, Error = error };
+                process.WaitForExit();
+                lock (outputSync)
+                lock (errorSync)
+                {
+                    return new ProcessResult
+                    {
+                        ExitCode = process.ExitCode,
+                        Output = output.ToString(),
+                        Error = error.ToString()
+                    };
+                }
             }
         }
 
@@ -176,6 +213,32 @@ namespace FastLinkDirectTool
         {
             string encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
             return Run("powershell.exe", "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded, timeoutMilliseconds);
+        }
+    }
+
+    internal static class AppLogger
+    {
+        private static readonly object Sync = new object();
+        public static readonly string LogPath = Path.Combine(Application.StartupPath, "runtime.log");
+
+        public static void Log(string message)
+        {
+            lock (Sync)
+            {
+                try
+                {
+                    if (File.Exists(LogPath) && new FileInfo(LogPath).Length > 2 * 1024 * 1024)
+                    {
+                        string oldPath = LogPath + ".old";
+                        File.Delete(oldPath);
+                        File.Move(LogPath, oldPath);
+                    }
+                    File.AppendAllText(LogPath,
+                        DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + message + Environment.NewLine,
+                        new UTF8Encoding(false));
+                }
+                catch { }
+            }
         }
     }
 
@@ -679,6 +742,26 @@ namespace FastLinkDirectTool
             }
         }
 
+        public void RemovePrivateNetworkRoutes()
+        {
+            lock (sync)
+            {
+                List<TrackedRoute> privateRoutes = state.Routes.Where(delegate(TrackedRoute route)
+                {
+                    string mask = route.Netmask ?? "255.255.255.255";
+                    return (route.Address == "10.0.0.0" && mask == "255.0.0.0") ||
+                        (route.Address == "172.16.0.0" && mask == "255.240.0.0") ||
+                        (route.Address == "192.168.0.0" && mask == "255.255.0.0");
+                }).ToList();
+                foreach (TrackedRoute route in privateRoutes)
+                {
+                    DeleteRoute(route);
+                    state.Routes.Remove(route);
+                }
+                if (privateRoutes.Count > 0) SaveLocked();
+            }
+        }
+
         private void DeleteRoute(TrackedRoute route)
         {
             string netmask = string.IsNullOrWhiteSpace(route.Netmask) ? "255.255.255.255" : route.Netmask;
@@ -697,6 +780,7 @@ namespace FastLinkDirectTool
     internal static class NrptManager
     {
         private const string Marker = "FastLinkDirectTool";
+        private const string AppliedMarker = "__FASTLINK_NRPT_APPLIED__";
 
         public static void Apply(IEnumerable<string> namespaces)
         {
@@ -708,9 +792,14 @@ namespace FastLinkDirectTool
                 string safe = value.Replace("'", "''");
                 script.AppendLine("Add-DnsClientNrptRule -Namespace '" + safe + "' -NameServers '127.0.0.1' -DisplayName 'FastLink Direct - " + safe + "' -Comment '" + Marker + "' | Out-Null");
             }
-            script.AppendLine("Clear-DnsClientCache");
-            ProcessResult result = ProcessRunner.RunPowerShell(script.ToString(), 30000);
-            if (result.ExitCode != 0) throw new InvalidOperationException("无法应用 Windows DNS 规则：" + result.Error + result.Output);
+            script.AppendLine("Write-Output '" + AppliedMarker + "'");
+            ProcessResult result = ProcessRunner.RunPowerShell(script.ToString(), 15000);
+            bool rulesApplied = result.Output.IndexOf(AppliedMarker, StringComparison.Ordinal) >= 0;
+            if (!rulesApplied)
+                throw new InvalidOperationException("无法应用 Windows DNS 规则：" + result.Error + result.Output);
+            if (result.ExitCode != 0)
+                AppLogger.Log("Windows DNS rules were applied before the command was force-closed.");
+            FlushDnsCache();
         }
 
         public static void RemoveAll()
@@ -718,13 +807,18 @@ namespace FastLinkDirectTool
             StringBuilder script = new StringBuilder();
             script.AppendLine("$ErrorActionPreference='SilentlyContinue'");
             AppendRemove(script);
-            script.AppendLine("Clear-DnsClientCache");
-            ProcessRunner.RunPowerShell(script.ToString(), 30000);
+            ProcessRunner.RunPowerShell(script.ToString(), 15000);
+            FlushDnsCache();
         }
 
         private static void AppendRemove(StringBuilder script)
         {
             script.AppendLine("Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object { $_.Comment -eq '" + Marker + "' } | Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue");
+        }
+
+        private static void FlushDnsCache()
+        {
+            ProcessRunner.Run("ipconfig.exe", "/flushdns", 5000);
         }
     }
 
@@ -935,6 +1029,7 @@ namespace FastLinkDirectTool
             int questionEnd;
             if (!DnsPacket.TryReadQuestion(query, out host, out type, out questionEnd)) return null;
             bool direct = ruleSet != null && ruleSet.Matches(host);
+            if (direct) AppLogger.Log("DNS DIRECT  " + host + "  type=" + type + "  via=" + network.DnsServer);
             if (direct && (type == 28 || type == 64 || type == 65))
                 return DnsPacket.BuildEmptyAnswer(query, questionEnd, 0);
 
@@ -950,6 +1045,8 @@ namespace FastLinkDirectTool
                     if (!routes.EnsureAddressRoute(address.Address, address.Ttl))
                         return DnsPacket.BuildEmptyAnswer(query, questionEnd, 2);
                 }
+                if (addresses.Count > 0)
+                    AppLogger.Log("DNS ANSWER  " + host + " -> " + string.Join(",", addresses.Select(delegate(DnsAnswerAddress item) { return item.Address.ToString(); }).ToArray()));
             }
             return response;
         }
@@ -1015,6 +1112,7 @@ namespace FastLinkDirectTool
         private readonly object sync = new object();
         private readonly RouteManager routes;
         private readonly DnsProxy proxy;
+        private bool privateNetworksEnabled;
         public bool Enabled { get; private set; }
         public PhysicalNetworkInfo Network { get; private set; }
 
@@ -1026,9 +1124,11 @@ namespace FastLinkDirectTool
 
         public void InitializeAndCleanLegacy()
         {
+            AppLogger.Log("Application initialization and stale-state cleanup started.");
             NrptManager.RemoveAll();
             routes.RemoveAll();
             LegacyCleanup.Run();
+            AppLogger.Log("Application initialization completed.");
         }
 
         public void Enable(RuleSet rules, bool directPrivateNetworks)
@@ -1036,10 +1136,12 @@ namespace FastLinkDirectTool
             lock (sync)
             {
                 if (Enabled) return;
+                AppLogger.Log("Enable requested. Rules=" + rules.NormalizedRules.Count + ", privateNetworks=" + directPrivateNetworks);
                 if (rules.NormalizedRules.Count == 0) throw new InvalidOperationException("请先添加至少一条域名规则。");
                 PhysicalNetworkInfo network = NetworkDetector.Detect();
                 if (network == null) throw new InvalidOperationException("没有找到可用的物理 Wi-Fi 或有线网卡。");
                 Network = network;
+                AppLogger.Log("Physical network detected: " + network.InterfaceName + ", DNS=" + network.DnsServer + ", gateway=" + network.Gateway);
                 routes.SetNetwork(network);
                 if (!routes.EnsureDnsRoute()) throw new InvalidOperationException("无法为物理 DNS 添加直连路由。");
                 foreach (IPAddress address in rules.GetDirectIpAddresses())
@@ -1052,8 +1154,11 @@ namespace FastLinkDirectTool
                 try
                 {
                     proxy.Start(network, rules, routes);
+                    AppLogger.Log("Local DNS proxy started; applying Windows DNS rules.");
                     NrptManager.Apply(rules.GetNrptNamespaces());
                     Enabled = true;
+                    privateNetworksEnabled = directPrivateNetworks;
+                    AppLogger.Log("Direct mode enabled on " + network.InterfaceName + ", DNS=" + network.DnsServer + ", gateway=" + network.Gateway);
                 }
                 catch
                 {
@@ -1061,6 +1166,7 @@ namespace FastLinkDirectTool
                     proxy.Stop();
                     routes.RemoveAll();
                     Network = null;
+                    AppLogger.Log("Enable failed; changes rolled back.");
                     throw;
                 }
             }
@@ -1075,6 +1181,34 @@ namespace FastLinkDirectTool
                 routes.RemoveAll();
                 Network = null;
                 Enabled = false;
+                privateNetworksEnabled = false;
+                AppLogger.Log("Direct mode disabled and routes removed.");
+            }
+        }
+
+        public void UpdateRules(RuleSet rules, bool directPrivateNetworks)
+        {
+            lock (sync)
+            {
+                if (!Enabled) return;
+                AppLogger.Log("Hot rule update started. Rules=" + rules.NormalizedRules.Count + ", privateNetworks=" + directPrivateNetworks);
+                proxy.UpdateRules(rules);
+                foreach (IPAddress address in rules.GetDirectIpAddresses())
+                {
+                    if (!routes.EnsureRuleAddressRoute(address))
+                        throw new InvalidOperationException("无法为 IP 地址 " + address + " 添加直连路由。");
+                }
+                if (directPrivateNetworks && !privateNetworksEnabled)
+                {
+                    if (!routes.EnsurePrivateNetworkRoutes()) throw new InvalidOperationException("无法添加内网直连路由。");
+                }
+                else if (!directPrivateNetworks && privateNetworksEnabled)
+                {
+                    routes.RemovePrivateNetworkRoutes();
+                }
+                NrptManager.Apply(rules.GetNrptNamespaces());
+                privateNetworksEnabled = directPrivateNetworks;
+                AppLogger.Log("Hot rule update completed.");
             }
         }
 
@@ -1143,7 +1277,9 @@ namespace FastLinkDirectTool
             string sid = WindowsIdentity.GetCurrent().User.Value;
             XmlWriterSettings settings = new XmlWriterSettings();
             settings.Indent = true;
-            settings.Encoding = new UTF8Encoding(false);
+            // Task Scheduler on some Chinese Windows installations rejects UTF-8
+            // task XML with "cannot switch encoding". UTF-16 is accepted reliably.
+            settings.Encoding = Encoding.Unicode;
             using (XmlWriter writer = XmlWriter.Create(temp, settings))
             {
                 string taskNamespace = "http://schemas.microsoft.com/windows/2004/02/mit/task";
@@ -1227,6 +1363,7 @@ namespace FastLinkDirectTool
         public MainForm(bool autoStartLaunch)
         {
             Text = "FastLink 直连助手";
+            AppLogger.Log("UI process started. AutoStartLaunch=" + autoStartLaunch);
             Icon = SystemIcons.Shield;
             StartPosition = FormStartPosition.CenterScreen;
             MinimumSize = new Size(680, 560);
@@ -1361,6 +1498,10 @@ namespace FastLinkDirectTool
 
             ContextMenuStrip trayMenu = new ContextMenuStrip();
             trayMenu.Items.Add("打开界面", null, delegate { ShowFromTray(); });
+            trayMenu.Items.Add("打开运行日志", null, delegate
+            {
+                try { Process.Start("notepad.exe", AppLogger.LogPath); } catch { }
+            });
             trayMenu.Items.Add("退出并清理", null, delegate { ExitAndClean(); });
             trayIcon = new NotifyIcon();
             trayIcon.Icon = SystemIcons.Shield;
@@ -1518,7 +1659,7 @@ namespace FastLinkDirectTool
             busy = true;
             RuleSet rules = CurrentRules();
             SafeLog("规则已修改，正在刷新…");
-            Task.Run(delegate { runtime.Restart(rules, config.DirectPrivateNetworks); }).ContinueWith(delegate(Task task)
+            Task.Run(delegate { runtime.UpdateRules(rules, config.DirectPrivateNetworks); }).ContinueWith(delegate(Task task)
             {
                 BeginInvoke((Action)delegate
                 {
@@ -1609,6 +1750,7 @@ namespace FastLinkDirectTool
                 return;
             }
             logBox.AppendText(DateTime.Now.ToString("HH:mm:ss") + "  " + message + Environment.NewLine);
+            AppLogger.Log(message);
         }
 
         private void HideToTray()
