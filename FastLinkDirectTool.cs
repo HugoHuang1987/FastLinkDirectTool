@@ -357,6 +357,170 @@ namespace FastLinkDirectTool
         }
     }
 
+    internal sealed class FastLinkRecoveryResult
+    {
+        public bool PhysicalNetworkRecovered;
+        public bool FastLinkRecovered;
+        public string Detail;
+    }
+
+    internal static class FastLinkRecovery
+    {
+        public static bool IsPhysicalNetworkUsable(string interfaceName)
+        {
+            if (string.IsNullOrWhiteSpace(interfaceName)) return false;
+            try
+            {
+                NetworkInterface adapter = NetworkInterface.GetAllNetworkInterfaces()
+                    .FirstOrDefault(delegate(NetworkInterface value)
+                    {
+                        return string.Equals(value.Name, interfaceName, StringComparison.OrdinalIgnoreCase);
+                    });
+                if (adapter == null || adapter.OperationalStatus != OperationalStatus.Up) return false;
+
+                IPInterfaceProperties properties = adapter.GetIPProperties();
+                bool hasAddress = properties.UnicastAddresses.Any(delegate(UnicastIPAddressInformation value)
+                {
+                    if (value.Address.AddressFamily != AddressFamily.InterNetwork ||
+                        IPAddress.IsLoopback(value.Address) ||
+                        value.Address.Equals(IPAddress.Any))
+                        return false;
+                    byte[] bytes = value.Address.GetAddressBytes();
+                    return bytes.Length == 4 && !(bytes[0] == 169 && bytes[1] == 254);
+                });
+                bool hasGateway = properties.GatewayAddresses.Any(delegate(GatewayIPAddressInformation value)
+                {
+                    return value.Address.AddressFamily == AddressFamily.InterNetwork &&
+                        !value.Address.Equals(IPAddress.Any);
+                });
+                return hasAddress && hasGateway;
+            }
+            catch { return false; }
+        }
+
+        public static FastLinkRecoveryResult Recover(string interfaceName)
+        {
+            FastLinkRecoveryResult result = new FastLinkRecoveryResult();
+            string executablePath = FindFastLinkExecutable();
+            if (string.IsNullOrWhiteSpace(executablePath))
+            {
+                result.Detail = "FastLink executable could not be located.";
+                return result;
+            }
+
+            AppLogger.Log("Controlled FastLink recovery started on " + interfaceName + ".");
+            StopProcesses("FastLink");
+            StopProcesses("FastLinkCore");
+            WaitUntilFastLinkStops(8);
+
+            ProcessResult renew = ProcessRunner.Run(
+                "ipconfig.exe",
+                "/renew \"" + EscapeArgument(interfaceName) + "\"",
+                30000);
+            result.PhysicalNetworkRecovered = WaitUntilPhysicalNetworkUsable(interfaceName, 30);
+            if (!result.PhysicalNetworkRecovered)
+            {
+                result.Detail = "FastLink was stopped, but WLAN did not obtain a usable address.";
+                AppLogger.Log(result.Detail + " RenewExitCode=" + renew.ExitCode);
+                return result;
+            }
+
+            try
+            {
+                ProcessStartInfo startInfo = new ProcessStartInfo();
+                startInfo.FileName = executablePath;
+                startInfo.UseShellExecute = true;
+                Process.Start(startInfo);
+            }
+            catch (Exception ex)
+            {
+                result.Detail = "WLAN recovered, but FastLink could not be started: " + ex.Message;
+                AppLogger.Log(result.Detail);
+                return result;
+            }
+
+            result.FastLinkRecovered = WaitUntilFastLinkStarts(45);
+            result.Detail = result.FastLinkRecovered
+                ? "WLAN and FastLink recovered automatically."
+                : "WLAN recovered, but FastLink did not reconnect automatically.";
+            AppLogger.Log(result.Detail);
+            return result;
+        }
+
+        private static string FindFastLinkExecutable()
+        {
+            try
+            {
+                Process current = Process.GetProcessesByName("FastLink").FirstOrDefault();
+                if (current != null)
+                {
+                    string path = current.MainModule.FileName;
+                    if (File.Exists(path)) return path;
+                }
+            }
+            catch { }
+
+            string[] candidates =
+            {
+                @"D:\Programs\FastLink\FastLink.exe",
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "FastLink", "FastLink.exe"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "FastLink", "FastLink.exe")
+            };
+            return candidates.FirstOrDefault(File.Exists);
+        }
+
+        private static void StopProcesses(string processName)
+        {
+            foreach (Process process in Process.GetProcessesByName(processName))
+            {
+                try
+                {
+                    process.Kill();
+                    process.WaitForExit(5000);
+                }
+                catch (Exception ex)
+                {
+                    AppLogger.Log("Could not stop " + processName + ": " + ex.Message);
+                }
+                finally { process.Dispose(); }
+            }
+        }
+
+        private static bool WaitUntilPhysicalNetworkUsable(string interfaceName, int seconds)
+        {
+            for (int i = 0; i < seconds; i++)
+            {
+                if (IsPhysicalNetworkUsable(interfaceName)) return true;
+                Thread.Sleep(1000);
+            }
+            return IsPhysicalNetworkUsable(interfaceName);
+        }
+
+        private static void WaitUntilFastLinkStops(int seconds)
+        {
+            for (int i = 0; i < seconds; i++)
+            {
+                if (!NetworkDetector.IsFastLinkActive()) return;
+                Thread.Sleep(1000);
+            }
+        }
+
+        private static bool WaitUntilFastLinkStarts(int seconds)
+        {
+            for (int i = 0; i < seconds; i++)
+            {
+                if (NetworkDetector.IsFastLinkActive()) return true;
+                Thread.Sleep(1000);
+            }
+            return NetworkDetector.IsFastLinkActive();
+        }
+
+        private static string EscapeArgument(string value)
+        {
+            return (value ?? string.Empty).Replace("\"", string.Empty);
+        }
+    }
+
     internal sealed class RulePattern
     {
         public string Text { get; private set; }
@@ -786,6 +950,7 @@ namespace FastLinkDirectTool
         {
             StringBuilder script = new StringBuilder();
             script.AppendLine("$ErrorActionPreference='Stop'");
+            script.AppendLine("$ProgressPreference='SilentlyContinue'");
             AppendRemove(script);
             foreach (string value in namespaces.Distinct(StringComparer.OrdinalIgnoreCase))
             {
@@ -793,7 +958,7 @@ namespace FastLinkDirectTool
                 script.AppendLine("Add-DnsClientNrptRule -Namespace '" + safe + "' -NameServers '127.0.0.1' -DisplayName 'FastLink Direct - " + safe + "' -Comment '" + Marker + "' | Out-Null");
             }
             script.AppendLine("Write-Output '" + AppliedMarker + "'");
-            ProcessResult result = ProcessRunner.RunPowerShell(script.ToString(), 15000);
+            ProcessResult result = ProcessRunner.RunPowerShell(script.ToString(), 60000);
             bool rulesApplied = result.Output.IndexOf(AppliedMarker, StringComparison.Ordinal) >= 0;
             if (!rulesApplied)
                 throw new InvalidOperationException("无法应用 Windows DNS 规则：" + result.Error + result.Output);
@@ -806,8 +971,9 @@ namespace FastLinkDirectTool
         {
             StringBuilder script = new StringBuilder();
             script.AppendLine("$ErrorActionPreference='SilentlyContinue'");
+            script.AppendLine("$ProgressPreference='SilentlyContinue'");
             AppendRemove(script);
-            ProcessRunner.RunPowerShell(script.ToString(), 15000);
+            ProcessRunner.RunPowerShell(script.ToString(), 30000);
             FlushDnsCache();
         }
 
@@ -1359,6 +1525,8 @@ namespace FastLinkDirectTool
         private bool manualOffUntilReconnect;
         private bool lastFastLinkActive;
         private bool allowExit;
+        private DateTime physicalNetworkMissingSince = DateTime.MinValue;
+        private DateTime nextNetworkRecoveryAllowed = DateTime.MinValue;
 
         public MainForm(bool autoStartLaunch)
         {
@@ -1574,6 +1742,39 @@ namespace FastLinkDirectTool
             fastLinkStatus.Text = active ? "Fastlink：已接通" : "Fastlink：未接通";
             fastLinkStatus.ForeColor = active ? Color.DarkGreen : Color.DimGray;
 
+            if (active && runtime.Enabled && runtime.Network != null &&
+                !FastLinkRecovery.IsPhysicalNetworkUsable(runtime.Network.InterfaceName))
+            {
+                if (physicalNetworkMissingSince == DateTime.MinValue)
+                {
+                    physicalNetworkMissingSince = DateTime.Now;
+                    SafeLog("检测到物理网络失去有效 IP，正在观察…");
+                }
+                networkStatus.Text = "物理网络：连接异常，等待自动恢复";
+                networkStatus.ForeColor = Color.DarkOrange;
+                if (DateTime.Now - physicalNetworkMissingSince >= TimeSpan.FromSeconds(8) &&
+                    DateTime.Now >= nextNetworkRecoveryAllowed)
+                {
+                    BeginFastLinkRecovery();
+                }
+                lastFastLinkActive = active;
+                return;
+            }
+            physicalNetworkMissingSince = DateTime.MinValue;
+            networkStatus.ForeColor = SystemColors.ControlText;
+
+            if (active && runtime.Enabled && runtime.Network != null)
+            {
+                PhysicalNetworkInfo currentNetwork = NetworkDetector.Detect();
+                if (currentNetwork != null &&
+                    !string.Equals(currentNetwork.Identity, runtime.Network.Identity, StringComparison.Ordinal))
+                {
+                    BeginPhysicalNetworkRefresh();
+                    lastFastLinkActive = active;
+                    return;
+                }
+            }
+
             if (!active)
             {
                 manualOffUntilReconnect = false;
@@ -1581,14 +1782,96 @@ namespace FastLinkDirectTool
             }
             else if (!lastFastLinkActive && config.AutoEnableWithFastLink && !manualOffUntilReconnect)
             {
-                BeginEnable("检测到 Fastlink，正在自动开启直连…");
+                if (NetworkDetector.Detect() != null)
+                    BeginEnable("检测到 Fastlink，正在自动开启直连…");
             }
             else if (active && config.AutoEnableWithFastLink && !runtime.Enabled && !manualOffUntilReconnect)
             {
-                BeginEnable("正在自动开启直连…");
+                if (NetworkDetector.Detect() != null)
+                    BeginEnable("正在自动开启直连…");
             }
             lastFastLinkActive = active;
             RefreshUi();
+        }
+
+        private void BeginPhysicalNetworkRefresh()
+        {
+            if (busy || !runtime.Enabled) return;
+            busy = true;
+            RuleSet rules = CurrentRules();
+            SafeLog("检测到 Wi-Fi、DNS 或网关变化，正在刷新直连规则…");
+            Task.Run(delegate
+            {
+                runtime.Restart(rules, config.DirectPrivateNetworks);
+            }).ContinueWith(delegate(Task task)
+            {
+                BeginInvoke((Action)delegate
+                {
+                    busy = false;
+                    if (task.IsFaulted)
+                    {
+                        string message = "网络切换后刷新失败：" + task.Exception.GetBaseException().Message;
+                        SafeLog(message);
+                        trayIcon.ShowBalloonTip(5000, "FastLink 直连助手", message, ToolTipIcon.Error);
+                    }
+                    else
+                    {
+                        SafeLog("网络已切换，直连规则已刷新。");
+                    }
+                    RefreshUi();
+                });
+            });
+        }
+
+        private void BeginFastLinkRecovery()
+        {
+            if (busy || runtime.Network == null) return;
+            busy = true;
+            nextNetworkRecoveryAllowed = DateTime.Now.AddMinutes(5);
+            string interfaceName = runtime.Network.InterfaceName;
+            RuleSet rules = CurrentRules();
+            SafeLog("正在自动重启 FastLink 并恢复 WLAN…");
+
+            Task.Run(delegate
+            {
+                runtime.Disable();
+                FastLinkRecoveryResult recovery = FastLinkRecovery.Recover(interfaceName);
+                if (recovery.FastLinkRecovered)
+                    runtime.Enable(rules, config.DirectPrivateNetworks);
+                return recovery;
+            }).ContinueWith(delegate(Task<FastLinkRecoveryResult> task)
+            {
+                BeginInvoke((Action)delegate
+                {
+                    busy = false;
+                    physicalNetworkMissingSince = DateTime.MinValue;
+                    if (task.IsFaulted)
+                    {
+                        string message = "自动恢复失败：" + task.Exception.GetBaseException().Message;
+                        SafeLog(message);
+                        trayIcon.ShowBalloonTip(5000, "FastLink 直连助手", message, ToolTipIcon.Error);
+                    }
+                    else if (task.Result.FastLinkRecovered && runtime.Enabled)
+                    {
+                        SafeLog("WLAN、FastLink 和直连规则已自动恢复。");
+                        trayIcon.ShowBalloonTip(4000, "FastLink 直连助手",
+                            "网络、FastLink 和直连规则已自动恢复", ToolTipIcon.Info);
+                    }
+                    else if (task.Result.PhysicalNetworkRecovered)
+                    {
+                        SafeLog("WLAN 已恢复，但 FastLink 未自动连接。");
+                        trayIcon.ShowBalloonTip(6000, "FastLink 直连助手",
+                            "WLAN 已恢复，请检查 FastLink 自动运行设置。", ToolTipIcon.Warning);
+                    }
+                    else
+                    {
+                        SafeLog("自动恢复未成功：" + task.Result.Detail);
+                        trayIcon.ShowBalloonTip(6000, "FastLink 直连助手",
+                            "WLAN 仍未恢复，请检查 Wi-Fi。", ToolTipIcon.Error);
+                    }
+                    RefreshUi();
+                });
+            });
         }
 
         private void MainSwitchChanged(object sender, EventArgs e)
