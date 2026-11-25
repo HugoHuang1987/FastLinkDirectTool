@@ -18,6 +18,9 @@ using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using System.Xml;
 
+[assembly: AssemblyVersion("2.6.6.0")]
+[assembly: AssemblyFileVersion("2.6.6.0")]
+
 namespace FastLinkDirectTool
 {
     internal static class Program
@@ -43,7 +46,9 @@ namespace FastLinkDirectTool
                     return string.Equals(value, "--autostart", StringComparison.OrdinalIgnoreCase);
                 });
 
-                MainForm form = new MainForm(autoStartLaunch);
+                bool openNetworkMode = args.Any(value => string.Equals(value, "--network-mode", StringComparison.OrdinalIgnoreCase));
+                bool prepareNetworkMode = !autoStartLaunch && openNetworkMode && args.Any(value => string.Equals(value, "--prepare-network-mode", StringComparison.OrdinalIgnoreCase));
+                MainForm form = new MainForm(autoStartLaunch, openNetworkMode, prepareNetworkMode);
                 Application.Run(form);
             }
         }
@@ -71,11 +76,142 @@ namespace FastLinkDirectTool
         }
     }
 
+    internal static class NativeWifiReader
+    {
+        private const uint ClientVersion = 2;
+        private const int CurrentConnectionOpcode = 7;
+        private const int ConnectedState = 1;
+
+        [System.Runtime.InteropServices.StructLayout(
+            System.Runtime.InteropServices.LayoutKind.Sequential,
+            CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        private struct WlanConnectionAttributes
+        {
+            public int State;
+            public int ConnectionMode;
+            [System.Runtime.InteropServices.MarshalAs(
+                System.Runtime.InteropServices.UnmanagedType.ByValTStr, SizeConst = 256)]
+            public string ProfileName;
+            public WlanAssociationAttributes Association;
+            public WlanSecurityAttributes Security;
+        }
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private struct WlanAssociationAttributes
+        {
+            public Dot11Ssid Ssid;
+            public int BssType;
+            [System.Runtime.InteropServices.MarshalAs(
+                System.Runtime.InteropServices.UnmanagedType.ByValArray, SizeConst = 6)]
+            public byte[] Bssid;
+            public int PhyType;
+            public uint PhyIndex;
+            public uint SignalQuality;
+            public uint ReceiveRate;
+            public uint TransmitRate;
+        }
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private struct Dot11Ssid
+        {
+            public uint Length;
+            [System.Runtime.InteropServices.MarshalAs(
+                System.Runtime.InteropServices.UnmanagedType.ByValArray, SizeConst = 32)]
+            public byte[] Value;
+        }
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private struct WlanSecurityAttributes
+        {
+            [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+            public bool SecurityEnabled;
+            [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+            public bool OneXEnabled;
+            public int AuthenticationAlgorithm;
+            public int CipherAlgorithm;
+        }
+
+        [System.Runtime.InteropServices.DllImport("wlanapi.dll")]
+        private static extern uint WlanOpenHandle(
+            uint clientVersion,
+            IntPtr reserved,
+            out uint negotiatedVersion,
+            out IntPtr clientHandle);
+
+        [System.Runtime.InteropServices.DllImport("wlanapi.dll")]
+        private static extern uint WlanQueryInterface(
+            IntPtr clientHandle,
+            ref Guid interfaceGuid,
+            int opcode,
+            IntPtr reserved,
+            out int dataSize,
+            out IntPtr data,
+            out int opcodeValueType);
+
+        [System.Runtime.InteropServices.DllImport("wlanapi.dll")]
+        private static extern void WlanFreeMemory(IntPtr memory);
+
+        [System.Runtime.InteropServices.DllImport("wlanapi.dll")]
+        private static extern uint WlanCloseHandle(IntPtr clientHandle, IntPtr reserved);
+
+        public static NetworkDetector.WifiConnectionInfo GetConnectedWifi(
+            string interfaceName, string interfaceId)
+        {
+            Guid interfaceGuid;
+            if (!Guid.TryParse(interfaceId, out interfaceGuid)) return null;
+
+            IntPtr handle = IntPtr.Zero;
+            IntPtr data = IntPtr.Zero;
+            try
+            {
+                uint negotiatedVersion;
+                if (WlanOpenHandle(ClientVersion, IntPtr.Zero, out negotiatedVersion, out handle) != 0)
+                    return null;
+
+                int dataSize;
+                int opcodeValueType;
+                if (WlanQueryInterface(handle, ref interfaceGuid, CurrentConnectionOpcode, IntPtr.Zero,
+                    out dataSize, out data, out opcodeValueType) != 0 || data == IntPtr.Zero)
+                    return null;
+
+                WlanConnectionAttributes attributes =
+                    (WlanConnectionAttributes)System.Runtime.InteropServices.Marshal.PtrToStructure(
+                        data, typeof(WlanConnectionAttributes));
+                if (attributes.State != ConnectedState || attributes.Association.Ssid.Value == null)
+                    return null;
+
+                int ssidLength = Math.Min((int)attributes.Association.Ssid.Length,
+                    attributes.Association.Ssid.Value.Length);
+                string ssid = Encoding.UTF8.GetString(attributes.Association.Ssid.Value, 0, ssidLength);
+                if (string.IsNullOrWhiteSpace(ssid)) return null;
+
+                return new NetworkDetector.WifiConnectionInfo
+                {
+                    InterfaceName = interfaceName,
+                    Ssid = ssid,
+                    Profile = string.IsNullOrWhiteSpace(attributes.ProfileName)
+                        ? null : attributes.ProfileName.Trim()
+                };
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Log("Native Wi-Fi query failed: " + ex.Message);
+                return null;
+            }
+            finally
+            {
+                if (data != IntPtr.Zero) WlanFreeMemory(data);
+                if (handle != IntPtr.Zero) WlanCloseHandle(handle, IntPtr.Zero);
+            }
+        }
+    }
+
     internal sealed class AppConfig
     {
         public bool AutoStart { get; set; }
         public bool AutoEnableWithFastLink { get; set; }
         public bool DirectPrivateNetworks { get; set; }
+        public bool AutoRestartFastLink { get; set; }
         public List<string> Rules { get; set; }
 
         public AppConfig()
@@ -83,6 +219,7 @@ namespace FastLinkDirectTool
             AutoStart = true;
             AutoEnableWithFastLink = true;
             DirectPrivateNetworks = false;
+            AutoRestartFastLink = false;
             Rules = new List<string>();
         }
     }
@@ -145,12 +282,15 @@ namespace FastLinkDirectTool
         public int ExitCode;
         public string Output;
         public string Error;
+        public bool TimedOut;
+        public long ElapsedMilliseconds;
     }
 
     internal static class ProcessRunner
     {
         public static ProcessResult Run(string fileName, string arguments, int timeoutMilliseconds)
         {
+            Stopwatch stopwatch = Stopwatch.StartNew();
             ProcessStartInfo info = new ProcessStartInfo();
             info.FileName = fileName;
             info.Arguments = arguments;
@@ -184,6 +324,12 @@ namespace FastLinkDirectTool
                     try { process.Kill(); } catch { }
                     try { process.WaitForExit(2000); } catch { }
                     AppLogger.Log("System command timed out: " + fileName);
+                    HealthEventLogger.Write("system_command_timeout", new Dictionary<string, object>
+                    {
+                        { "file", Path.GetFileName(fileName) },
+                        { "timeout_ms", timeoutMilliseconds },
+                        { "elapsed_ms", stopwatch.ElapsedMilliseconds }
+                    });
                     lock (outputSync)
                     lock (errorSync)
                     {
@@ -191,7 +337,9 @@ namespace FastLinkDirectTool
                         {
                             ExitCode = -1,
                             Output = output.ToString(),
-                            Error = error.ToString() + "Operation timed out."
+                            Error = error.ToString() + "Operation timed out.",
+                            TimedOut = true,
+                            ElapsedMilliseconds = stopwatch.ElapsedMilliseconds
                         };
                     }
                 }
@@ -203,7 +351,9 @@ namespace FastLinkDirectTool
                     {
                         ExitCode = process.ExitCode,
                         Output = output.ToString(),
-                        Error = error.ToString()
+                        Error = error.ToString(),
+                        TimedOut = false,
+                        ElapsedMilliseconds = stopwatch.ElapsedMilliseconds
                     };
                 }
             }
@@ -212,7 +362,20 @@ namespace FastLinkDirectTool
         public static ProcessResult RunPowerShell(string script, int timeoutMilliseconds)
         {
             string encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
-            return Run("powershell.exe", "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded, timeoutMilliseconds);
+            if (encoded.Length < 24000)
+                return Run("powershell.exe", "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded, timeoutMilliseconds);
+            // CreateProcess has a command-line length limit. Large rule sets use a
+            // unique temporary script, with a BOM for Windows PowerShell 5.1.
+            string path = Path.Combine(Path.GetTempPath(), "FastLinkDirectTool-" + Guid.NewGuid().ToString("N") + ".ps1");
+            try
+            {
+                File.WriteAllText(path, script, new UTF8Encoding(true));
+                return Run("powershell.exe", "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" + path + "\"", timeoutMilliseconds);
+            }
+            finally
+            {
+                try { File.Delete(path); } catch { AppLogger.Log("Temporary helper script cleanup failed: " + Path.GetFileName(path)); }
+            }
         }
     }
 
@@ -242,28 +405,90 @@ namespace FastLinkDirectTool
         }
     }
 
+    internal static class HealthEventLogger
+    {
+        private static readonly object Sync = new object();
+        public static readonly string LogPath = Path.Combine(
+            ConfigStore.DataDirectory, "health-events.jsonl");
+
+        public static void Write(string eventName)
+        {
+            Write(eventName, null);
+        }
+
+        public static void Write(string eventName, IDictionary<string, object> details)
+        {
+            lock (Sync)
+            {
+                try
+                {
+                    Directory.CreateDirectory(ConfigStore.DataDirectory);
+                    if (File.Exists(LogPath) && new FileInfo(LogPath).Length > 5 * 1024 * 1024)
+                    {
+                        string oldPath = LogPath + ".old";
+                        if (File.Exists(oldPath)) File.Delete(oldPath);
+                        File.Move(LogPath, oldPath);
+                    }
+
+                    Dictionary<string, object> record = new Dictionary<string, object>();
+                    record["timestamp"] = DateTime.Now.ToString("o");
+                    record["timestamp_utc"] = DateTime.UtcNow.ToString("o");
+                    record["event"] = eventName;
+                    record["process_id"] = Process.GetCurrentProcess().Id;
+                    if (details != null)
+                    {
+                        foreach (KeyValuePair<string, object> item in details)
+                            record[item.Key] = item.Value;
+                    }
+
+                    string json = new JavaScriptSerializer().Serialize(record);
+                    File.AppendAllText(LogPath, json + Environment.NewLine, new UTF8Encoding(false));
+                }
+                catch { }
+            }
+        }
+    }
+
     internal sealed class PhysicalNetworkInfo
     {
         public string InterfaceName;
+        public string InterfaceId;
         public int InterfaceIndex;
+        public bool IsWireless;
         public IPAddress LocalAddress;
         public IPAddress Gateway;
         public IPAddress DnsServer;
         public IPAddress FastLinkDns;
+        public string ProxyConnectionIdentity;
+        public string WifiSsid;
+        public string WifiProfile;
 
         public string Identity
         {
             get
             {
                 return InterfaceIndex.ToString(CultureInfo.InvariantCulture) + "|" +
-                    Gateway + "|" + DnsServer + "|" + LocalAddress;
+                    Gateway + "|" + DnsServer + "|" + LocalAddress + "|" +
+                    FastLinkDns + "|" + (ProxyConnectionIdentity ?? string.Empty);
             }
         }
     }
 
     internal static class NetworkDetector
     {
+        internal sealed class WifiConnectionInfo
+        {
+            public string InterfaceName;
+            public string Ssid;
+            public string Profile;
+        }
+
         public static bool IsFastLinkActive()
+        {
+            return IsLegacyTunnelActive() || FastLinkConnectionCompatibility.GetCurrent().Active;
+        }
+
+        public static bool IsLegacyTunnelActive()
         {
             try
             {
@@ -286,7 +511,7 @@ namespace FastLinkDirectTool
             return false;
         }
 
-        public static PhysicalNetworkInfo Detect()
+        public static PhysicalNetworkInfo Detect(bool includeWifiDetails = false)
         {
             IPAddress fastLinkDns = null;
             List<Tuple<int, PhysicalNetworkInfo>> candidates = new List<Tuple<int, PhysicalNetworkInfo>>();
@@ -334,7 +559,9 @@ namespace FastLinkDirectTool
 
                 PhysicalNetworkInfo candidate = new PhysicalNetworkInfo();
                 candidate.InterfaceName = adapter.Name;
+                candidate.InterfaceId = adapter.Id;
                 candidate.InterfaceIndex = ipv4.Index;
+                candidate.IsWireless = adapter.NetworkInterfaceType == NetworkInterfaceType.Wireless80211;
                 candidate.LocalAddress = localInfo.Address;
                 candidate.Gateway = gatewayInfo.Address;
                 candidate.DnsServer = dns;
@@ -346,8 +573,82 @@ namespace FastLinkDirectTool
                 .Select(delegate(Tuple<int, PhysicalNetworkInfo> item) { return item.Item2; })
                 .FirstOrDefault();
             if (selected == null) return null;
-            selected.FastLinkDns = fastLinkDns ?? IPAddress.Parse("198.18.0.2");
+            // No TUN exists in the new system-proxy-only mode. Unmatched DNS
+            // requests must use physical DNS, not an unreachable fake-IP server.
+            selected.FastLinkDns = fastLinkDns ?? selected.DnsServer;
+            FastLinkConnectionInfo connection = FastLinkConnectionCompatibility.GetCurrent();
+            selected.ProxyConnectionIdentity = connection.Active ? connection.ProxyServerIdentity : string.Empty;
+            if (includeWifiDetails && selected.IsWireless)
+            {
+                WifiConnectionInfo wifi = null;
+                for (int attempt = 0; attempt < 3 && wifi == null; attempt++)
+                {
+                    wifi = GetConnectedWifi(selected.InterfaceName, selected.InterfaceId);
+                    if (wifi == null && attempt < 2) Thread.Sleep(400);
+                }
+                if (wifi != null)
+                {
+                    selected.WifiSsid = wifi.Ssid;
+                    selected.WifiProfile = wifi.Profile;
+                }
+                else
+                {
+                    AppLogger.Log("Wi-Fi is usable, but its SSID could not be read after three attempts.");
+                }
+            }
             return selected;
+        }
+
+        public static WifiConnectionInfo GetConnectedWifi(string interfaceName, string interfaceId = null)
+        {
+            if (string.IsNullOrWhiteSpace(interfaceName)) return null;
+            WifiConnectionInfo native = NativeWifiReader.GetConnectedWifi(interfaceName, interfaceId);
+            if (native != null) return native;
+            try
+            {
+                ProcessResult result = ProcessRunner.Run(
+                    "netsh.exe", "wlan show interfaces name=\"" +
+                    interfaceName.Replace("\"", string.Empty) + "\"", 5000);
+                if (result.ExitCode != 0 || string.IsNullOrWhiteSpace(result.Output)) return null;
+
+                WifiConnectionInfo current = null;
+                foreach (string rawLine in result.Output.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
+                {
+                    Match nameMatch = Regex.Match(
+                        rawLine, @"^\s*(?:Name|名称)\s*:\s*(.+?)\s*$", RegexOptions.IgnoreCase);
+                    if (nameMatch.Success)
+                    {
+                        if (current != null &&
+                            string.Equals(current.InterfaceName, interfaceName, StringComparison.OrdinalIgnoreCase))
+                            return string.IsNullOrWhiteSpace(current.Ssid) ? null : current;
+                        current = new WifiConnectionInfo { InterfaceName = nameMatch.Groups[1].Value.Trim() };
+                        continue;
+                    }
+                    if (current == null) continue;
+
+                    Match ssidMatch = Regex.Match(
+                        rawLine, @"^\s*SSID\s*:\s*(.+?)\s*$", RegexOptions.IgnoreCase);
+                    if (ssidMatch.Success)
+                    {
+                        current.Ssid = ssidMatch.Groups[1].Value.Trim();
+                        continue;
+                    }
+                    Match profileMatch = Regex.Match(
+                        rawLine, @"^\s*(?:Profile|配置文件)\s*:\s*(.+?)\s*$", RegexOptions.IgnoreCase);
+                    if (profileMatch.Success)
+                        current.Profile = profileMatch.Groups[1].Value.Trim();
+                }
+
+                if (current != null &&
+                    string.Equals(current.InterfaceName, interfaceName, StringComparison.OrdinalIgnoreCase) &&
+                    !string.IsNullOrWhiteSpace(current.Ssid))
+                    return current;
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Log("Could not read the connected Wi-Fi name: " + ex.Message);
+            }
+            return null;
         }
 
         private static bool IsFastLinkRange(IPAddress address)
@@ -361,7 +662,15 @@ namespace FastLinkDirectTool
     {
         public bool PhysicalNetworkRecovered;
         public bool FastLinkRecovered;
+        public bool PreferredWifiRecovered;
+        public bool UsedFallbackWifi;
+        public string PreferredWifiSsid;
+        public string RecoveredWifiSsid;
         public string Detail;
+        public ProxyProbeResult ProxyProbe;
+        public bool DirectRulesRebuilt;
+        public long RecoveryElapsedMilliseconds;
+        public int ProxyVerificationSuccesses;
     }
 
     internal static class FastLinkRecovery
@@ -398,9 +707,11 @@ namespace FastLinkDirectTool
             catch { return false; }
         }
 
-        public static FastLinkRecoveryResult Recover(string interfaceName)
+        public static FastLinkRecoveryResult Recover(
+            string interfaceName, string interfaceId, string preferredWifiSsid, string preferredWifiProfile)
         {
             FastLinkRecoveryResult result = new FastLinkRecoveryResult();
+            result.PreferredWifiSsid = preferredWifiSsid;
             string executablePath = FindFastLinkExecutable();
             if (string.IsNullOrWhiteSpace(executablePath))
             {
@@ -408,16 +719,30 @@ namespace FastLinkDirectTool
                 return result;
             }
 
-            AppLogger.Log("Controlled FastLink recovery started on " + interfaceName + ".");
+            AppLogger.Log("Controlled FastLink recovery started on " + interfaceName +
+                (string.IsNullOrWhiteSpace(preferredWifiSsid) ? "." : ", preferred SSID=" + preferredWifiSsid + "."));
             StopProcesses("FastLink");
             StopProcesses("FastLinkCore");
             WaitUntilFastLinkStops(8);
+
+            if (!string.IsNullOrWhiteSpace(preferredWifiSsid))
+                RequestPreferredWifi(interfaceName, preferredWifiSsid, preferredWifiProfile);
 
             ProcessResult renew = ProcessRunner.Run(
                 "ipconfig.exe",
                 "/renew \"" + EscapeArgument(interfaceName) + "\"",
                 30000);
-            result.PhysicalNetworkRecovered = WaitUntilPhysicalNetworkUsable(interfaceName, 30);
+            if (!string.IsNullOrWhiteSpace(preferredWifiSsid))
+                result.PreferredWifiRecovered = WaitUntilPreferredWifiUsable(
+                    interfaceName, interfaceId, preferredWifiSsid, preferredWifiProfile, 45);
+
+            result.PhysicalNetworkRecovered = result.PreferredWifiRecovered ||
+                WaitUntilPhysicalNetworkUsable(interfaceName, string.IsNullOrWhiteSpace(preferredWifiSsid) ? 30 : 5);
+            NetworkDetector.WifiConnectionInfo recoveredWifi =
+                NetworkDetector.GetConnectedWifi(interfaceName, interfaceId);
+            result.RecoveredWifiSsid = recoveredWifi == null ? null : recoveredWifi.Ssid;
+            result.UsedFallbackWifi = result.PhysicalNetworkRecovered &&
+                !string.IsNullOrWhiteSpace(preferredWifiSsid) && !result.PreferredWifiRecovered;
             if (!result.PhysicalNetworkRecovered)
             {
                 result.Detail = "FastLink was stopped, but WLAN did not obtain a usable address.";
@@ -440,9 +765,98 @@ namespace FastLinkDirectTool
             }
 
             result.FastLinkRecovered = WaitUntilFastLinkStarts(45);
+            if (result.FastLinkRecovered && result.UsedFallbackWifi)
+                result.Detail = "FastLink recovered on fallback Wi-Fi " +
+                    (string.IsNullOrWhiteSpace(result.RecoveredWifiSsid) ? "(unknown)" : result.RecoveredWifiSsid) +
+                    "; preferred Wi-Fi " + preferredWifiSsid + " is still unavailable.";
+            else if (result.FastLinkRecovered)
+                result.Detail = "Preferred WLAN and FastLink recovered automatically.";
+            else
+                result.Detail = "WLAN recovered, but FastLink did not reconnect automatically.";
+            AppLogger.Log(result.Detail);
+            return result;
+        }
+
+        private static void RequestPreferredWifi(string interfaceName, string ssid, string profile)
+        {
+            string profileName = string.IsNullOrWhiteSpace(profile) ? ssid : profile;
+            ProcessResult connect = ProcessRunner.Run(
+                "netsh.exe",
+                "wlan connect name=\"" + EscapeArgument(profileName) + "\" ssid=\"" +
+                    EscapeArgument(ssid) + "\" interface=\"" + EscapeArgument(interfaceName) + "\"",
+                10000);
+            AppLogger.Log("Requested preferred Wi-Fi " + ssid + ". ExitCode=" + connect.ExitCode);
+        }
+
+        private static bool WaitUntilPreferredWifiUsable(
+            string interfaceName, string interfaceId, string preferredWifiSsid,
+            string preferredWifiProfile, int seconds)
+        {
+            for (int i = 0; i < seconds; i++)
+            {
+                if (i > 0 && i % 10 == 0)
+                    RequestPreferredWifi(interfaceName, preferredWifiSsid, preferredWifiProfile);
+
+                if (i % 2 == 0)
+                {
+                    NetworkDetector.WifiConnectionInfo wifi =
+                        NetworkDetector.GetConnectedWifi(interfaceName, interfaceId);
+                    if (wifi != null &&
+                        string.Equals(wifi.Ssid, preferredWifiSsid, StringComparison.OrdinalIgnoreCase) &&
+                        IsPhysicalNetworkUsable(interfaceName))
+                        return true;
+                }
+                Thread.Sleep(1000);
+            }
+
+            NetworkDetector.WifiConnectionInfo finalWifi =
+                NetworkDetector.GetConnectedWifi(interfaceName, interfaceId);
+            return finalWifi != null &&
+                string.Equals(finalWifi.Ssid, preferredWifiSsid, StringComparison.OrdinalIgnoreCase) &&
+                IsPhysicalNetworkUsable(interfaceName);
+        }
+
+        public static FastLinkRecoveryResult RestartFastLink(string interfaceName)
+        {
+            FastLinkRecoveryResult result = new FastLinkRecoveryResult();
+            result.PhysicalNetworkRecovered = IsPhysicalNetworkUsable(interfaceName);
+            if (!result.PhysicalNetworkRecovered)
+            {
+                result.Detail = "Physical network is not usable; FastLink restart was skipped.";
+                AppLogger.Log(result.Detail);
+                return result;
+            }
+
+            string executablePath = FindFastLinkExecutable();
+            if (string.IsNullOrWhiteSpace(executablePath))
+            {
+                result.Detail = "FastLink executable could not be located.";
+                return result;
+            }
+
+            AppLogger.Log("Controlled FastLink-only recovery started on " + interfaceName + ".");
+            StopProcesses("FastLink");
+            StopProcesses("FastLinkCore");
+            WaitUntilFastLinkStops(8);
+
+            try
+            {
+                ProcessStartInfo startInfo = new ProcessStartInfo();
+                startInfo.FileName = executablePath;
+                startInfo.UseShellExecute = true;
+                Process.Start(startInfo);
+            }
+            catch (Exception ex)
+            {
+                result.Detail = "FastLink could not be restarted: " + ex.Message;
+                AppLogger.Log(result.Detail);
+                return result;
+            }
+
+            result.FastLinkRecovered = WaitUntilFastLinkStarts(45);
             result.Detail = result.FastLinkRecovered
-                ? "WLAN and FastLink recovered automatically."
-                : "WLAN recovered, but FastLink did not reconnect automatically.";
+                ? "FastLink restarted automatically after a proxy health failure."
+                : "FastLink did not reconnect after the proxy health failure.";
             AppLogger.Log(result.Detail);
             return result;
         }
@@ -518,6 +932,93 @@ namespace FastLinkDirectTool
         private static string EscapeArgument(string value)
         {
             return (value ?? string.Empty).Replace("\"", string.Empty);
+        }
+    }
+
+    internal sealed class ProxyProbeResult
+    {
+        public bool Healthy;
+        public bool TimedOut;
+        public int StatusCode;
+        public long ElapsedMilliseconds;
+        public string Error;
+    }
+
+    internal static class ProxyHealthProbe
+    {
+        public static bool HasWorkingTransport()
+        {
+            return Probe("https://chatgpt.com/favicon.ico", 7000).Healthy;
+        }
+
+        public static bool HasWorkingTransport(string uri, int timeoutMilliseconds)
+        {
+            return Probe(uri, timeoutMilliseconds).Healthy;
+        }
+
+        public static ProxyProbeResult Probe()
+        {
+            return Probe("https://chatgpt.com/favicon.ico", 7000);
+        }
+
+        public static ProxyProbeResult Probe(string uri, int timeoutMilliseconds)
+        {
+            ProxyProbeResult result = new ProxyProbeResult();
+            Stopwatch stopwatch = Stopwatch.StartNew();
+            HttpWebResponse response = null;
+            HttpWebRequest request = null;
+            IAsyncResult asyncResult = null;
+            try
+            {
+                try
+                {
+                    ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;
+                }
+                catch { }
+
+                request = (HttpWebRequest)WebRequest.Create(uri);
+                request.Method = "HEAD";
+                request.AllowAutoRedirect = false;
+                request.Timeout = timeoutMilliseconds;
+                request.ReadWriteTimeout = timeoutMilliseconds;
+                request.UserAgent = "FastLinkDirectTool/2.5.1";
+                request.Headers[HttpRequestHeader.CacheControl] = "no-cache";
+                asyncResult = request.BeginGetResponse(null, null);
+                if (!asyncResult.AsyncWaitHandle.WaitOne(timeoutMilliseconds))
+                {
+                    result.TimedOut = true;
+                    result.Error = "hard_timeout";
+                    try { request.Abort(); } catch { }
+                    return result;
+                }
+                response = (HttpWebResponse)request.EndGetResponse(asyncResult);
+                result.Healthy = true;
+                result.StatusCode = (int)response.StatusCode;
+                return result;
+            }
+            catch (WebException ex)
+            {
+                response = ex.Response as HttpWebResponse;
+                result.Healthy = response != null;
+                result.StatusCode = response == null ? 0 : (int)response.StatusCode;
+                result.Error = ex.Status.ToString();
+                return result;
+            }
+            catch (Exception ex)
+            {
+                result.Error = ex.GetType().Name + ": " + ex.Message;
+                return result;
+            }
+            finally
+            {
+                stopwatch.Stop();
+                result.ElapsedMilliseconds = stopwatch.ElapsedMilliseconds;
+                if (response != null) response.Close();
+                if (asyncResult != null)
+                {
+                    try { asyncResult.AsyncWaitHandle.Close(); } catch { }
+                }
+            }
         }
     }
 
@@ -729,32 +1230,62 @@ namespace FastLinkDirectTool
     internal sealed class RouteManager
     {
         private readonly object sync = new object();
+        private readonly Func<string, string, int, ProcessResult> runCommand;
+        private readonly Action<RouteState> saveState;
         private RouteState state;
         private PhysicalNetworkInfo network;
+        private long ensureRequests;
+        private long addAttempts;
+        private long addSucceeded;
+        private long commandTimeouts;
+        private long suppressedMutations;
+        private long routeMutationBlockedUntilUtcTicks;
+        private long lastSuppressedLogUtcTicks;
 
-        public RouteManager()
+        public RouteManager() : this(
+            ConfigStore.LoadJson<RouteState>(ConfigStore.RouteStatePath) ?? new RouteState(),
+            ProcessRunner.Run,
+            delegate(RouteState value) { ConfigStore.SaveJson(ConfigStore.RouteStatePath, value); })
         {
-            state = ConfigStore.LoadJson<RouteState>(ConfigStore.RouteStatePath) ?? new RouteState();
+        }
+
+        // Tests inject all command/persistence boundaries; no real routes or files.
+        internal RouteManager(RouteState initialState, Func<string, string, int, ProcessResult> command,
+            Action<RouteState> save)
+        {
+            if (initialState == null) throw new ArgumentNullException("initialState");
+            if (command == null) throw new ArgumentNullException("command");
+            if (save == null) throw new ArgumentNullException("save");
+            state = initialState;
+            runCommand = command;
+            saveState = save;
             if (state.Routes == null) state.Routes = new List<TrackedRoute>();
         }
 
         public void SetNetwork(PhysicalNetworkInfo value)
         {
+            // A null route network drains an in-flight write and prevents DNS
+            // callbacks from starting more writes. It does NOT stop the DNS
+            // listener or clear DnsProxy's separate upstream snapshot, and it
+            // deliberately leaves explicit tracked-route cleanup available.
             lock (sync) { network = value; }
         }
 
         public bool EnsureDnsRoute()
         {
+            Interlocked.Increment(ref ensureRequests);
             lock (sync)
             {
                 if (network == null) return false;
-                return EnsureRouteLocked(network.DnsServer, 0, true);
+                return EnsureRouteLocked(network.DnsServer, 0, true) && HasPhysicalHostRoute(network.DnsServer);
             }
         }
 
         public bool EnsureAddressRoute(IPAddress address, uint ttl)
         {
             if (address == null || address.AddressFamily != AddressFamily.InterNetwork) return true;
+            if (IsFakeIp(address)) return false;
+            Interlocked.Increment(ref ensureRequests);
             lock (sync)
             {
                 if (network == null) return false;
@@ -766,6 +1297,8 @@ namespace FastLinkDirectTool
         public bool EnsureRuleAddressRoute(IPAddress address)
         {
             if (address == null || address.AddressFamily != AddressFamily.InterNetwork) return false;
+            if (IsFakeIp(address)) return false;
+            Interlocked.Increment(ref ensureRequests);
             lock (sync)
             {
                 if (network == null) return false;
@@ -773,8 +1306,16 @@ namespace FastLinkDirectTool
             }
         }
 
+        internal static bool IsFakeIp(IPAddress address)
+        {
+            if (address == null || address.AddressFamily != AddressFamily.InterNetwork) return false;
+            byte[] bytes = address.GetAddressBytes();
+            return bytes[0] == 198 && (bytes[1] == 18 || bytes[1] == 19);
+        }
+
         public bool EnsurePrivateNetworkRoutes()
         {
+            Interlocked.Increment(ref ensureRequests);
             lock (sync)
             {
                 if (network == null) return false;
@@ -794,15 +1335,22 @@ namespace FastLinkDirectTool
                     string.Equals(route.Gateway, network.Gateway.ToString(), StringComparison.OrdinalIgnoreCase);
             });
             if (tracked != null) return true;
-            if (HasPhysicalRoute(destination, netmask)) return true;
+            if (!CanMutateLocked(destination)) return false;
 
             string arguments = string.Format(CultureInfo.InvariantCulture,
                 "ADD {0} MASK {1} {2} METRIC 1 IF {3}",
                 destination, netmask, network.Gateway, network.InterfaceIndex);
-            ProcessResult result = ProcessRunner.Run("route.exe", arguments, 10000);
+            Interlocked.Increment(ref addAttempts);
+            ProcessResult result = runCommand("route.exe", arguments, 5000);
+            if (result.TimedOut)
+            {
+                RecordTimeoutLocked("add_network", destination, result);
+                return false;
+            }
             if (result.ExitCode != 0 && !HasPhysicalRoute(destination, netmask)) return false;
             if (result.ExitCode == 0)
             {
+                Interlocked.Increment(ref addSucceeded);
                 state.Routes.Add(new TrackedRoute
                 {
                     Address = destination,
@@ -829,20 +1377,30 @@ namespace FastLinkDirectTool
             });
             if (tracked != null)
             {
-                if (expiresTicks > tracked.ExpiresUtcTicks) tracked.ExpiresUtcTicks = expiresTicks;
-                SaveLocked();
+                if (expiresTicks > tracked.ExpiresUtcTicks + TimeSpan.FromSeconds(30).Ticks)
+                {
+                    tracked.ExpiresUtcTicks = expiresTicks;
+                    SaveLocked();
+                }
                 return true;
             }
 
-            if (HasPhysicalHostRoute(address)) return true;
+            if (!CanMutateLocked(address.ToString())) return false;
 
             string arguments = string.Format(CultureInfo.InvariantCulture,
                 "ADD {0} MASK 255.255.255.255 {1} METRIC 1 IF {2}",
                 address, network.Gateway, network.InterfaceIndex);
-            ProcessResult result = ProcessRunner.Run("route.exe", arguments, 10000);
+            Interlocked.Increment(ref addAttempts);
+            ProcessResult result = runCommand("route.exe", arguments, 5000);
+            if (result.TimedOut)
+            {
+                RecordTimeoutLocked("add_host", address.ToString(), result);
+                return false;
+            }
             if (result.ExitCode != 0 && !HasPhysicalHostRoute(address)) return false;
             if (result.ExitCode == 0)
             {
+                Interlocked.Increment(ref addSucceeded);
                 state.Routes.Add(new TrackedRoute
                 {
                     Address = address.ToString(),
@@ -865,7 +1423,7 @@ namespace FastLinkDirectTool
 
         private bool HasPhysicalRoute(string destination, string netmask)
         {
-            ProcessResult result = ProcessRunner.Run("route.exe", "PRINT -4 " + destination, 5000);
+            ProcessResult result = runCommand("route.exe", "PRINT -4 " + destination, 5000);
             if (result.ExitCode != 0) return false;
             string[] lines = result.Output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
             foreach (string line in lines)
@@ -889,8 +1447,7 @@ namespace FastLinkDirectTool
                 }).ToList();
                 foreach (TrackedRoute route in expired)
                 {
-                    DeleteRoute(route);
-                    state.Routes.Remove(route);
+                    if (DeleteRouteLocked(route)) state.Routes.Remove(route);
                 }
                 if (expired.Count > 0) SaveLocked();
             }
@@ -900,9 +1457,13 @@ namespace FastLinkDirectTool
         {
             lock (sync)
             {
-                foreach (TrackedRoute route in state.Routes.ToList()) DeleteRoute(route);
-                state.Routes.Clear();
+                foreach (TrackedRoute route in state.Routes.ToList())
+                {
+                    if (DeleteRouteLocked(route)) state.Routes.Remove(route);
+                }
                 SaveLocked();
+                if (state.Routes.Count != 0)
+                    throw new InvalidOperationException("直连路由尚有残留，已保留记录，请稍后重试清理。");
             }
         }
 
@@ -919,25 +1480,86 @@ namespace FastLinkDirectTool
                 }).ToList();
                 foreach (TrackedRoute route in privateRoutes)
                 {
-                    DeleteRoute(route);
-                    state.Routes.Remove(route);
+                    if (DeleteRouteLocked(route)) state.Routes.Remove(route);
                 }
                 if (privateRoutes.Count > 0) SaveLocked();
             }
         }
 
-        private void DeleteRoute(TrackedRoute route)
+        private bool DeleteRouteLocked(TrackedRoute route)
         {
+            if (!CanMutateLocked(route.Address)) return false;
             string netmask = string.IsNullOrWhiteSpace(route.Netmask) ? "255.255.255.255" : route.Netmask;
             string arguments = string.Format(CultureInfo.InvariantCulture,
                 "DELETE {0} MASK {1} {2} IF {3}",
                 route.Address, netmask, route.Gateway, route.InterfaceIndex);
-            ProcessRunner.Run("route.exe", arguments, 10000);
+            ProcessResult result = runCommand("route.exe", arguments, 5000);
+            if (result.TimedOut)
+            {
+                RecordTimeoutLocked("delete", route.Address, result);
+                return false;
+            }
+            ProcessResult check = runCommand("route.exe", "PRINT -4 " + route.Address, 5000);
+            if (check.TimedOut || check.ExitCode != 0) return false;
+            foreach (string line in check.Output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string[] parts = Regex.Split(line.Trim(), "\\s+");
+                if (parts.Length >= 5 && parts[0] == route.Address && parts[1] == netmask &&
+                    parts[2] == route.Gateway && parts[3] == route.LocalAddress) return false;
+            }
+            return true;
+        }
+
+        private bool CanMutateLocked(string destination)
+        {
+            long now = DateTime.UtcNow.Ticks;
+            if (now >= routeMutationBlockedUntilUtcTicks) return true;
+            Interlocked.Increment(ref suppressedMutations);
+            if (now - lastSuppressedLogUtcTicks > TimeSpan.FromSeconds(10).Ticks)
+            {
+                lastSuppressedLogUtcTicks = now;
+                HealthEventLogger.Write("route_mutation_suppressed", new Dictionary<string, object>
+                {
+                    { "destination", destination },
+                    { "blocked_until_utc", new DateTime(routeMutationBlockedUntilUtcTicks, DateTimeKind.Utc).ToString("o") }
+                });
+            }
+            return false;
+        }
+
+        private void RecordTimeoutLocked(string operation, string destination, ProcessResult result)
+        {
+            Interlocked.Increment(ref commandTimeouts);
+            routeMutationBlockedUntilUtcTicks = DateTime.UtcNow.AddSeconds(25).Ticks;
+            HealthEventLogger.Write("route_command_timeout", new Dictionary<string, object>
+            {
+                { "operation", operation },
+                { "destination", destination },
+                { "elapsed_ms", result.ElapsedMilliseconds },
+                { "blocked_seconds", 25 }
+            });
+        }
+
+        public IDictionary<string, object> GetHealthDetails()
+        {
+            lock (sync)
+            {
+                Dictionary<string, object> details = new Dictionary<string, object>();
+                details["route_ensure_requests"] = Interlocked.Read(ref ensureRequests);
+                details["route_add_attempts"] = Interlocked.Read(ref addAttempts);
+                details["route_add_succeeded"] = Interlocked.Read(ref addSucceeded);
+                details["route_command_timeouts"] = Interlocked.Read(ref commandTimeouts);
+                details["route_mutations_suppressed"] = Interlocked.Read(ref suppressedMutations);
+                details["route_tracked_count"] = state.Routes.Count;
+                details["route_circuit_open"] = DateTime.UtcNow.Ticks < routeMutationBlockedUntilUtcTicks;
+                details["route_dns_writes_paused"] = network == null;
+                return details;
+            }
         }
 
         private void SaveLocked()
         {
-            ConfigStore.SaveJson(ConfigStore.RouteStatePath, state);
+            saveState(state);
         }
     }
 
@@ -945,46 +1567,131 @@ namespace FastLinkDirectTool
     {
         private const string Marker = "FastLinkDirectTool";
         private const string AppliedMarker = "__FASTLINK_NRPT_APPLIED__";
+        private const string RemovedMarker = "__FASTLINK_NRPT_REMOVED__";
 
         public static void Apply(IEnumerable<string> namespaces)
+        {
+            List<string> expected = namespaces.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            ProcessResult result = ProcessRunner.RunPowerShell(BuildApplyScript(expected), ApplyTimeoutMilliseconds(expected.Count));
+            LogResult("apply", result, expected.Count);
+            VerifyCommandResult(result, AppliedMarker, "应用 Windows DNS 规则");
+            FlushDnsCache();
+        }
+
+        internal static int ApplyTimeoutMilliseconds(int namespaceCount)
+        {
+            // Large lists invoke Windows management once per rule. Allow bounded
+            // progress without turning a slow operation into an endless retry loop.
+            return (int)Math.Min(300000L, Math.Max(120000L, 30000L + Math.Max(0, namespaceCount) * 3000L));
+        }
+
+        private static void LogResult(string operation, ProcessResult result, int expectedCount)
+        {
+            string progress = (result.Output ?? string.Empty).Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                .LastOrDefault(delegate(string line) { return line.StartsWith("__FASTLINK_NRPT_STAGE__"); }) ?? "no_progress_output";
+            HealthEventLogger.Write("nrpt_command_result", new Dictionary<string, object>
+            {
+                { "operation", operation }, { "expected_count", expectedCount },
+                { "timed_out", result.TimedOut }, { "exit_code", result.ExitCode },
+                { "elapsed_ms", result.ElapsedMilliseconds }, { "last_progress", progress }
+            });
+        }
+
+        internal static string BuildApplyScript(IEnumerable<string> namespaces)
+        {
+            List<string> expected = namespaces.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            StringBuilder script = new StringBuilder();
+            script.AppendLine("$ErrorActionPreference='Stop'");
+            script.AppendLine("$ProgressPreference='SilentlyContinue'");
+            AppendRemove(script);
+            script.AppendLine("Write-Output '__FASTLINK_NRPT_STAGE__ apply_start'");
+            int added = 0;
+            foreach (string value in expected)
+            {
+                string safe = value.Replace("'", "''");
+                script.AppendLine("Add-DnsClientNrptRule -Namespace '" + safe + "' -NameServers '127.0.0.1' -DisplayName 'FastLink Direct - " + safe + "' -Comment '" + Marker + "' | Out-Null");
+                added++;
+                script.AppendLine("Write-Output '__FASTLINK_NRPT_STAGE__ applied " + added + "/" + expected.Count + "'");
+            }
+            script.AppendLine("Write-Output '__FASTLINK_NRPT_STAGE__ apply_readback'");
+            script.AppendLine("$actual=@(Get-DnsClientNrptRule -ErrorAction Stop | Where-Object { $_.Comment -eq '" + Marker + "' })");
+            script.AppendLine("if ($actual.Count -ne " + expected.Count.ToString(CultureInfo.InvariantCulture) + ") { throw 'NRPT apply readback count mismatch.' }");
+            script.AppendLine("$expected=@(" + string.Join(",", expected.Select(delegate(string value) { return "'" + value.Replace("'", "''") + "'"; }).ToArray()) + ")");
+            script.AppendLine("foreach ($ns in $expected) { if (-not @($actual | Where-Object { $_.Namespace -contains $ns -and $_.NameServers -eq '127.0.0.1' }).Count) { throw 'NRPT apply readback mismatch.' } }");
+            script.AppendLine("Write-Output '" + AppliedMarker + "'");
+            return script.ToString();
+        }
+
+        public static void RemoveAll()
+        {
+            ProcessResult result = ProcessRunner.RunPowerShell(BuildRemoveScript(), 120000);
+            LogResult("remove", result, 0);
+            VerifyCommandResult(result, RemovedMarker, "清理 Windows DNS 规则");
+            FlushDnsCache();
+        }
+
+        internal static string BuildRemoveScript()
         {
             StringBuilder script = new StringBuilder();
             script.AppendLine("$ErrorActionPreference='Stop'");
             script.AppendLine("$ProgressPreference='SilentlyContinue'");
             AppendRemove(script);
-            foreach (string value in namespaces.Distinct(StringComparer.OrdinalIgnoreCase))
-            {
-                string safe = value.Replace("'", "''");
-                script.AppendLine("Add-DnsClientNrptRule -Namespace '" + safe + "' -NameServers '127.0.0.1' -DisplayName 'FastLink Direct - " + safe + "' -Comment '" + Marker + "' | Out-Null");
-            }
-            script.AppendLine("Write-Output '" + AppliedMarker + "'");
-            ProcessResult result = ProcessRunner.RunPowerShell(script.ToString(), 60000);
-            bool rulesApplied = result.Output.IndexOf(AppliedMarker, StringComparison.Ordinal) >= 0;
-            if (!rulesApplied)
-                throw new InvalidOperationException("无法应用 Windows DNS 规则：" + result.Error + result.Output);
-            if (result.ExitCode != 0)
-                AppLogger.Log("Windows DNS rules were applied before the command was force-closed.");
-            FlushDnsCache();
+            script.AppendLine("Write-Output '" + RemovedMarker + "'");
+            return script.ToString();
         }
 
-        public static void RemoveAll()
+        internal static void VerifyCommandResult(ProcessResult result, string marker, string operation)
         {
-            StringBuilder script = new StringBuilder();
-            script.AppendLine("$ErrorActionPreference='SilentlyContinue'");
-            script.AppendLine("$ProgressPreference='SilentlyContinue'");
-            AppendRemove(script);
-            ProcessRunner.RunPowerShell(script.ToString(), 30000);
-            FlushDnsCache();
+            bool verified = result != null && !result.TimedOut && result.ExitCode == 0 &&
+                (result.Output ?? string.Empty).Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                    .Any(delegate(string line) { return line.Trim() == marker; });
+            if (!verified)
+            {
+                throw new InvalidOperationException(operation + "未确认成功；保留 DNS 服务并停止后续清理。" +
+                    (result == null ? string.Empty : result.Error));
+            }
         }
 
         private static void AppendRemove(StringBuilder script)
         {
-            script.AppendLine("Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object { $_.Comment -eq '" + Marker + "' } | Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue");
+            script.AppendLine("Write-Output '__FASTLINK_NRPT_STAGE__ cleanup_read'");
+            script.AppendLine("$owned=@(Get-DnsClientNrptRule -ErrorAction Stop | Where-Object { $_.Comment -eq '" + Marker + "' })");
+            script.AppendLine("$removed=0");
+            script.AppendLine("foreach ($rule in $owned) { Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction Stop; $removed++; Write-Output ('__FASTLINK_NRPT_STAGE__ removed ' + $removed + '/' + $owned.Count) }");
+            script.AppendLine("Write-Output '__FASTLINK_NRPT_STAGE__ cleanup_readback'");
+            script.AppendLine("$remaining=@(Get-DnsClientNrptRule -ErrorAction Stop | Where-Object { $_.Comment -eq '" + Marker + "' })");
+            script.AppendLine("if ($remaining.Count -ne 0) { throw ('NRPT cleanup incomplete: ' + $remaining.Count) }");
         }
 
         private static void FlushDnsCache()
         {
-            ProcessRunner.Run("ipconfig.exe", "/flushdns", 5000);
+            ProcessResult result = ProcessRunner.Run("ipconfig.exe", "/flushdns", 5000);
+            if (result.TimedOut || result.ExitCode != 0)
+                throw new InvalidOperationException("DNS 缓存刷新未完成，请稍后重试；尚未停止 DNS 服务。");
+        }
+    }
+
+    internal static class SafeCleanup
+    {
+        internal static void Run(Action pauseRouteWrites, Action removeDnsRules,
+            Action removeProxyBypass, Action stopDns, Action removeRoutes)
+        {
+            pauseRouteWrites();
+            Run(delegate
+            {
+                // Keep direct exceptions until DNS-rule removal is verified.
+                // Either failure must preserve the still-required DNS listener.
+                removeDnsRules();
+                removeProxyBypass();
+            }, stopDns, removeRoutes);
+        }
+
+        internal static void Run(Action removeDnsRules, Action stopDns, Action removeRoutes)
+        {
+            // Do not stop a listener while Windows may still send it DNS queries.
+            removeDnsRules();
+            stopDns();
+            removeRoutes();
         }
     }
 
@@ -1095,12 +1802,31 @@ namespace FastLinkDirectTool
 
     internal sealed class DnsProxy : IDisposable
     {
+        private sealed class DnsCacheEntry
+        {
+            public byte[] Response;
+            public long ExpiresUtcTicks;
+        }
+
         private volatile bool running;
+        public bool IsRunning { get { return running; } }
         private volatile RuleSet ruleSet;
         private PhysicalNetworkInfo network;
         private RouteManager routes;
         private UdpClient udpListener;
         private TcpListener tcpListener;
+        private readonly object querySync = new object();
+        private readonly Dictionary<string, DnsCacheEntry> responseCache = new Dictionary<string, DnsCacheEntry>();
+        private readonly Dictionary<string, TaskCompletionSource<byte[]>> inFlight = new Dictionary<string, TaskCompletionSource<byte[]>>();
+        private readonly SemaphoreSlim querySlots = new SemaphoreSlim(48, 48);
+        private long totalQueries;
+        private long directQueries;
+        private long cacheHits;
+        private long coalescedQueries;
+        private long upstreamFailures;
+        private long routeFailures;
+        private long overloadedQueries;
+        private long lastFailureLogUtcTicks;
 
         public void Start(PhysicalNetworkInfo networkInfo, RuleSet rules, RouteManager routeManager)
         {
@@ -1119,7 +1845,11 @@ namespace FastLinkDirectTool
             Task.Run((Action)TcpLoop);
         }
 
-        public void UpdateRules(RuleSet rules) { ruleSet = rules; }
+        public void UpdateRules(RuleSet rules)
+        {
+            ruleSet = rules;
+            lock (querySync) responseCache.Clear();
+        }
 
         public void Stop()
         {
@@ -1128,6 +1858,7 @@ namespace FastLinkDirectTool
             try { tcpListener.Stop(); } catch { }
             udpListener = null;
             tcpListener = null;
+            lock (querySync) responseCache.Clear();
         }
 
         private void UdpLoop()
@@ -1146,9 +1877,23 @@ namespace FastLinkDirectTool
 
         private void HandleUdp(byte[] query, IPEndPoint client)
         {
-            byte[] response = HandleQuery(query, false);
-            if (response == null || !running) return;
-            try { udpListener.Send(response, response.Length, client); } catch { }
+            bool entered = querySlots.Wait(0);
+            try
+            {
+                byte[] response;
+                if (entered) response = HandleQuery(query, false);
+                else
+                {
+                    Interlocked.Increment(ref overloadedQueries);
+                    response = BuildServFail(query);
+                }
+                if (response == null || !running) return;
+                try { udpListener.Send(response, response.Length, client); } catch { }
+            }
+            finally
+            {
+                if (entered) querySlots.Release();
+            }
         }
 
         private void TcpLoop()
@@ -1178,7 +1923,21 @@ namespace FastLinkDirectTool
                     int length = (lengthBytes[0] << 8) | lengthBytes[1];
                     byte[] query = ReadExact(stream, length);
                     if (query == null) return;
-                    byte[] response = HandleQuery(query, true);
+                    bool entered = querySlots.Wait(0);
+                    byte[] response;
+                    try
+                    {
+                        if (entered) response = HandleQuery(query, true);
+                        else
+                        {
+                            Interlocked.Increment(ref overloadedQueries);
+                            response = BuildServFail(query);
+                        }
+                    }
+                    finally
+                    {
+                        if (entered) querySlots.Release();
+                    }
                     if (response == null) return;
                     stream.WriteByte((byte)(response.Length >> 8));
                     stream.WriteByte((byte)(response.Length & 0xFF));
@@ -1194,27 +1953,183 @@ namespace FastLinkDirectTool
             ushort type;
             int questionEnd;
             if (!DnsPacket.TryReadQuestion(query, out host, out type, out questionEnd)) return null;
+            Interlocked.Increment(ref totalQueries);
             bool direct = ruleSet != null && ruleSet.Matches(host);
-            if (direct) AppLogger.Log("DNS DIRECT  " + host + "  type=" + type + "  via=" + network.DnsServer);
+            if (direct) Interlocked.Increment(ref directQueries);
             if (direct && (type == 28 || type == 64 || type == 65))
                 return DnsPacket.BuildEmptyAnswer(query, questionEnd, 0);
 
             IPAddress upstream = direct ? network.DnsServer : network.FastLinkDns;
-            byte[] response = tcp ? ForwardTcp(query, upstream) : ForwardUdp(query, upstream);
-            if (response == null) return DnsPacket.BuildEmptyAnswer(query, questionEnd, 2);
-
-            if (direct && type == 1)
+            if (!direct)
             {
-                List<DnsAnswerAddress> addresses = DnsPacket.ReadAAnswers(response);
-                foreach (DnsAnswerAddress address in addresses)
+                byte[] normalResponse = tcp ? ForwardTcp(query, upstream) : ForwardUdp(query, upstream);
+                if (normalResponse == null)
                 {
-                    if (!routes.EnsureAddressRoute(address.Address, address.Ttl))
-                        return DnsPacket.BuildEmptyAnswer(query, questionEnd, 2);
+                    Interlocked.Increment(ref upstreamFailures);
+                    LogFailure("dns_upstream_failure", host, type, upstream, "no_response");
+                    return DnsPacket.BuildEmptyAnswer(query, questionEnd, 2);
                 }
-                if (addresses.Count > 0)
-                    AppLogger.Log("DNS ANSWER  " + host + " -> " + string.Join(",", addresses.Select(delegate(DnsAnswerAddress item) { return item.Address.ToString(); }).ToArray()));
+                return normalResponse;
             }
-            return response;
+
+            string key = host + "|" + type.ToString(CultureInfo.InvariantCulture);
+            TaskCompletionSource<byte[]> owner = null;
+            Task<byte[]> sharedTask = null;
+            long now = DateTime.UtcNow.Ticks;
+            lock (querySync)
+            {
+                DnsCacheEntry cached;
+                if (responseCache.TryGetValue(key, out cached))
+                {
+                    if (cached.ExpiresUtcTicks > now)
+                    {
+                        Interlocked.Increment(ref cacheHits);
+                        return CopyWithTransactionId(cached.Response, query);
+                    }
+                    responseCache.Remove(key);
+                }
+
+                TaskCompletionSource<byte[]> existing;
+                if (inFlight.TryGetValue(key, out existing))
+                {
+                    sharedTask = existing.Task;
+                    Interlocked.Increment(ref coalescedQueries);
+                }
+                else
+                {
+                    owner = new TaskCompletionSource<byte[]>();
+                    inFlight[key] = owner;
+                }
+            }
+
+            if (owner == null)
+            {
+                try
+                {
+                    if (sharedTask.Wait(6500))
+                        return CopyWithTransactionId(sharedTask.Result, query);
+                }
+                catch { }
+                return DnsPacket.BuildEmptyAnswer(query, questionEnd, 2);
+            }
+
+            byte[] response = null;
+            try
+            {
+                response = tcp ? ForwardTcp(query, upstream) : ForwardUdp(query, upstream);
+                if (response == null)
+                {
+                    Interlocked.Increment(ref upstreamFailures);
+                    LogFailure("dns_upstream_failure", host, type, upstream, "no_response");
+                    response = DnsPacket.BuildEmptyAnswer(query, questionEnd, 2);
+                }
+
+                if (type == 1)
+                {
+                    List<DnsAnswerAddress> addresses = DnsPacket.ReadAAnswers(response);
+                    foreach (DnsAnswerAddress address in addresses)
+                    {
+                        if (!routes.EnsureAddressRoute(address.Address, address.Ttl))
+                        {
+                            Interlocked.Increment(ref routeFailures);
+                            LogFailure("dns_route_failure", host, type, upstream, address.Address.ToString());
+                            response = DnsPacket.BuildEmptyAnswer(query, questionEnd, 2);
+                            break;
+                        }
+                    }
+                }
+
+                int cacheSeconds = IsSuccessfulResponse(response) ? 30 : 2;
+                lock (querySync)
+                {
+                    if (responseCache.Count > 512)
+                    {
+                        foreach (string expiredKey in responseCache.Where(delegate(KeyValuePair<string, DnsCacheEntry> item)
+                        {
+                            return item.Value.ExpiresUtcTicks <= DateTime.UtcNow.Ticks;
+                        }).Select(delegate(KeyValuePair<string, DnsCacheEntry> item) { return item.Key; }).ToList())
+                            responseCache.Remove(expiredKey);
+                        if (responseCache.Count > 512) responseCache.Clear();
+                    }
+                    responseCache[key] = new DnsCacheEntry
+                    {
+                        Response = (byte[])response.Clone(),
+                        ExpiresUtcTicks = DateTime.UtcNow.AddSeconds(cacheSeconds).Ticks
+                    };
+                }
+                return response;
+            }
+            catch (Exception ex)
+            {
+                Interlocked.Increment(ref upstreamFailures);
+                LogFailure("dns_query_failure", host, type, upstream, ex.GetType().Name + ": " + ex.Message);
+                response = DnsPacket.BuildEmptyAnswer(query, questionEnd, 2);
+                return response;
+            }
+            finally
+            {
+                lock (querySync) inFlight.Remove(key);
+                try { owner.SetResult(response); } catch { }
+            }
+        }
+
+        private static bool IsSuccessfulResponse(byte[] response)
+        {
+            return response != null && response.Length >= 4 && (response[3] & 0x0F) == 0;
+        }
+
+        private static byte[] CopyWithTransactionId(byte[] response, byte[] query)
+        {
+            if (response == null) return null;
+            byte[] copy = (byte[])response.Clone();
+            if (copy.Length >= 2 && query != null && query.Length >= 2)
+            {
+                copy[0] = query[0];
+                copy[1] = query[1];
+            }
+            return copy;
+        }
+
+        private static byte[] BuildServFail(byte[] query)
+        {
+            string host;
+            ushort type;
+            int questionEnd;
+            if (!DnsPacket.TryReadQuestion(query, out host, out type, out questionEnd)) return null;
+            return DnsPacket.BuildEmptyAnswer(query, questionEnd, 2);
+        }
+
+        private void LogFailure(string eventName, string host, ushort type, IPAddress upstream, string reason)
+        {
+            long now = DateTime.UtcNow.Ticks;
+            long previous = Interlocked.Read(ref lastFailureLogUtcTicks);
+            if (now - previous < TimeSpan.FromSeconds(10).Ticks) return;
+            if (Interlocked.CompareExchange(ref lastFailureLogUtcTicks, now, previous) != previous) return;
+            HealthEventLogger.Write(eventName, new Dictionary<string, object>
+            {
+                { "host", host },
+                { "query_type", type },
+                { "upstream", upstream == null ? string.Empty : upstream.ToString() },
+                { "reason", reason }
+            });
+        }
+
+        public IDictionary<string, object> GetHealthDetails()
+        {
+            Dictionary<string, object> details = new Dictionary<string, object>();
+            details["dns_total_queries"] = Interlocked.Read(ref totalQueries);
+            details["dns_direct_queries"] = Interlocked.Read(ref directQueries);
+            details["dns_cache_hits"] = Interlocked.Read(ref cacheHits);
+            details["dns_coalesced_queries"] = Interlocked.Read(ref coalescedQueries);
+            details["dns_upstream_failures"] = Interlocked.Read(ref upstreamFailures);
+            details["dns_route_failures"] = Interlocked.Read(ref routeFailures);
+            details["dns_overloaded_queries"] = Interlocked.Read(ref overloadedQueries);
+            lock (querySync)
+            {
+                details["dns_cache_entries"] = responseCache.Count;
+                details["dns_inflight_queries"] = inFlight.Count;
+            }
+            return details;
         }
 
         private static byte[] ForwardUdp(byte[] query, IPAddress upstream)
@@ -1278,23 +2193,43 @@ namespace FastLinkDirectTool
         private readonly object sync = new object();
         private readonly RouteManager routes;
         private readonly DnsProxy proxy;
+        private readonly SystemProxyBypassManager systemProxyBypass;
         private bool privateNetworksEnabled;
         public bool Enabled { get; private set; }
+        public bool CleanupPending { get; private set; }
         public PhysicalNetworkInfo Network { get; private set; }
 
         public RuntimeController()
         {
             routes = new RouteManager();
             proxy = new DnsProxy();
+            systemProxyBypass = new SystemProxyBypassManager();
+        }
+
+        private void EnterCleanupPending()
+        {
+            // Runtime/UI gates do not cover asynchronous DNS callbacks. Detach
+            // their route writer too, retaining DNS and its upstream snapshot.
+            routes.SetNetwork(null);
+            CleanupPending = true;
         }
 
         public void InitializeAndCleanLegacy()
         {
             AppLogger.Log("Application initialization and stale-state cleanup started.");
-            NrptManager.RemoveAll();
-            routes.RemoveAll();
-            LegacyCleanup.Run();
-            AppLogger.Log("Application initialization completed.");
+            try
+            {
+                SafeCleanup.Run(delegate { routes.SetNetwork(null); }, NrptManager.RemoveAll,
+                    systemProxyBypass.Remove, delegate { }, routes.RemoveAll);
+                LegacyCleanup.Run();
+                CleanupPending = false;
+                AppLogger.Log("Application initialization completed.");
+            }
+            catch
+            {
+                EnterCleanupPending();
+                throw;
+            }
         }
 
         public void Enable(RuleSet rules, bool directPrivateNetworks)
@@ -1302,37 +2237,47 @@ namespace FastLinkDirectTool
             lock (sync)
             {
                 if (Enabled) return;
+                if (CleanupPending) throw new InvalidOperationException("仍有待完成的清理，请先关闭直连重试清理。");
                 AppLogger.Log("Enable requested. Rules=" + rules.NormalizedRules.Count + ", privateNetworks=" + directPrivateNetworks);
                 if (rules.NormalizedRules.Count == 0) throw new InvalidOperationException("请先添加至少一条域名规则。");
-                PhysicalNetworkInfo network = NetworkDetector.Detect();
+                PhysicalNetworkInfo network = NetworkDetector.Detect(true);
                 if (network == null) throw new InvalidOperationException("没有找到可用的物理 Wi-Fi 或有线网卡。");
                 Network = network;
-                AppLogger.Log("Physical network detected: " + network.InterfaceName + ", DNS=" + network.DnsServer + ", gateway=" + network.Gateway);
+                AppLogger.Log("Physical network detected: " + network.InterfaceName +
+                    (string.IsNullOrWhiteSpace(network.WifiSsid) ? string.Empty : ", SSID=" + network.WifiSsid) +
+                    ", DNS=" + network.DnsServer + ", gateway=" + network.Gateway);
                 routes.SetNetwork(network);
-                if (!routes.EnsureDnsRoute()) throw new InvalidOperationException("无法为物理 DNS 添加直连路由。");
-                foreach (IPAddress address in rules.GetDirectIpAddresses())
-                {
-                    if (!routes.EnsureRuleAddressRoute(address))
-                        throw new InvalidOperationException("无法为 IP 地址 " + address + " 添加直连路由。");
-                }
-                if (directPrivateNetworks && !routes.EnsurePrivateNetworkRoutes())
-                    throw new InvalidOperationException("无法添加内网直连路由。");
                 try
                 {
+                    if (!routes.EnsureDnsRoute()) throw new InvalidOperationException("无法为物理 DNS 添加直连路由。");
+                    foreach (IPAddress address in rules.GetDirectIpAddresses())
+                    {
+                        if (!routes.EnsureRuleAddressRoute(address))
+                            throw new InvalidOperationException("无法为 IP 地址 " + address + " 添加直连路由。");
+                    }
+                    if (directPrivateNetworks && !routes.EnsurePrivateNetworkRoutes())
+                        throw new InvalidOperationException("无法添加内网直连路由。");
                     proxy.Start(network, rules, routes);
                     AppLogger.Log("Local DNS proxy started; applying Windows DNS rules.");
                     NrptManager.Apply(rules.GetNrptNamespaces());
+                    SyncSystemProxyBypass(rules, directPrivateNetworks);
                     Enabled = true;
+                    CleanupPending = false;
                     privateNetworksEnabled = directPrivateNetworks;
                     AppLogger.Log("Direct mode enabled on " + network.InterfaceName + ", DNS=" + network.DnsServer + ", gateway=" + network.Gateway);
                 }
-                catch
+                catch (Exception enableError)
                 {
-                    NrptManager.RemoveAll();
-                    proxy.Stop();
-                    routes.RemoveAll();
-                    Network = null;
-                    AppLogger.Log("Enable failed; changes rolled back.");
+                    try
+                    {
+                        Disable();
+                        AppLogger.Log("Enable failed; rollback verified.");
+                    }
+                    catch (Exception cleanupError)
+                    {
+                        AppLogger.Log("Enable rollback incomplete; DNS listener retained when required: " + cleanupError.Message);
+                        throw new AggregateException("开启失败且清理未完成；请重试清理，勿强制结束助手。", enableError, cleanupError);
+                    }
                     throw;
                 }
             }
@@ -1342,13 +2287,31 @@ namespace FastLinkDirectTool
         {
             lock (sync)
             {
-                NrptManager.RemoveAll();
-                proxy.Stop();
-                routes.RemoveAll();
-                Network = null;
-                Enabled = false;
-                privateNetworksEnabled = false;
-                AppLogger.Log("Direct mode disabled and routes removed.");
+                try
+                {
+                    // Suspend DNS-triggered writes BEFORE potentially slow NRPT
+                    // commands. Cleanup failure must not let the DNS workers
+                    // resume ADD operations when the short route circuit expires.
+                    SafeCleanup.Run(delegate { routes.SetNetwork(null); }, NrptManager.RemoveAll,
+                        systemProxyBypass.Remove, proxy.Stop, routes.RemoveAll);
+                    Network = null;
+                    Enabled = false;
+                    CleanupPending = false;
+                    privateNetworksEnabled = false;
+                    AppLogger.Log("Direct mode disabled; DNS rule and route cleanup verified.");
+                }
+                catch (Exception error)
+                {
+                    EnterCleanupPending();
+                    Enabled = proxy.IsRunning;
+                    AppLogger.Log("Cleanup incomplete; listener running=" + proxy.IsRunning + ". " + error.Message);
+                    HealthEventLogger.Write("cleanup_incomplete", new Dictionary<string, object>
+                    {
+                        { "dns_listener_running", proxy.IsRunning },
+                        { "error", error.Message }
+                    });
+                    throw;
+                }
             }
         }
 
@@ -1356,23 +2319,34 @@ namespace FastLinkDirectTool
         {
             lock (sync)
             {
+                if (CleanupPending) throw new InvalidOperationException("清理未完成，已暂停规则刷新；请先重试安全清理。");
                 if (!Enabled) return;
                 AppLogger.Log("Hot rule update started. Rules=" + rules.NormalizedRules.Count + ", privateNetworks=" + directPrivateNetworks);
-                proxy.UpdateRules(rules);
-                foreach (IPAddress address in rules.GetDirectIpAddresses())
+                try
                 {
-                    if (!routes.EnsureRuleAddressRoute(address))
-                        throw new InvalidOperationException("无法为 IP 地址 " + address + " 添加直连路由。");
+                    proxy.UpdateRules(rules);
+                    foreach (IPAddress address in rules.GetDirectIpAddresses())
+                    {
+                        if (!routes.EnsureRuleAddressRoute(address))
+                            throw new InvalidOperationException("无法为 IP 地址 " + address + " 添加直连路由。");
+                    }
+                    if (directPrivateNetworks && !privateNetworksEnabled)
+                    {
+                        if (!routes.EnsurePrivateNetworkRoutes()) throw new InvalidOperationException("无法添加内网直连路由。");
+                    }
+                    else if (!directPrivateNetworks && privateNetworksEnabled)
+                    {
+                        routes.RemovePrivateNetworkRoutes();
+                    }
+                    NrptManager.Apply(rules.GetNrptNamespaces());
+                    SyncSystemProxyBypass(rules, directPrivateNetworks);
                 }
-                if (directPrivateNetworks && !privateNetworksEnabled)
+                catch (Exception error)
                 {
-                    if (!routes.EnsurePrivateNetworkRoutes()) throw new InvalidOperationException("无法添加内网直连路由。");
+                    EnterCleanupPending();
+                    HealthEventLogger.Write("rule_update_incomplete", new Dictionary<string, object> { { "error", error.Message } });
+                    throw;
                 }
-                else if (!directPrivateNetworks && privateNetworksEnabled)
-                {
-                    routes.RemovePrivateNetworkRoutes();
-                }
-                NrptManager.Apply(rules.GetNrptNamespaces());
                 privateNetworksEnabled = directPrivateNetworks;
                 AppLogger.Log("Hot rule update completed.");
             }
@@ -1384,7 +2358,64 @@ namespace FastLinkDirectTool
             Enable(rules, directPrivateNetworks);
         }
 
-        public void RemoveExpiredRoutes() { routes.RemoveExpired(); }
+        private void SyncSystemProxyBypass(RuleSet rules, bool directPrivateNetworks)
+        {
+            FastLinkConnectionInfo verified = FastLinkConnectionCompatibility.GetCurrent();
+            if (verified.Active)
+                systemProxyBypass.Apply(rules, directPrivateNetworks, verified.ProxyServerIdentity);
+            else
+                systemProxyBypass.Remove();
+        }
+
+        public void RemoveExpiredRoutes()
+        {
+            lock (sync)
+            {
+                if (!Enabled || CleanupPending) return;
+                routes.RemoveExpired();
+            }
+        }
+
+        public void MaintainSystemProxyBypass()
+        {
+            lock (sync)
+            {
+                if (!Enabled || CleanupPending || !FastLinkConnectionCompatibility.GetCurrent().Active) return;
+                try
+                {
+                    if (systemProxyBypass.EnsureCurrent())
+                        AppLogger.Log("System proxy direct exceptions restored after external refresh.");
+                }
+                catch
+                {
+                    // Keep DNS alive, pause further mutations, and expose failure
+                    // through the existing explicit safe-cleanup UI gate.
+                    EnterCleanupPending();
+                    throw;
+                }
+            }
+        }
+
+        public IDictionary<string, object> GetHealthDetails()
+        {
+            Dictionary<string, object> details = new Dictionary<string, object>();
+            details["direct_enabled"] = Enabled;
+            details["cleanup_pending"] = CleanupPending;
+            details["system_proxy_owned_bypass_count"] = systemProxyBypass.OwnedTokenCount;
+            PhysicalNetworkInfo current = Network;
+            if (current != null)
+            {
+                details["physical_interface"] = current.InterfaceName;
+                details["physical_interface_index"] = current.InterfaceIndex;
+                details["physical_local_address"] = current.LocalAddress == null ? string.Empty : current.LocalAddress.ToString();
+                details["physical_gateway"] = current.Gateway == null ? string.Empty : current.Gateway.ToString();
+                details["physical_dns"] = current.DnsServer == null ? string.Empty : current.DnsServer.ToString();
+                details["wifi_ssid"] = current.WifiSsid ?? string.Empty;
+            }
+            foreach (KeyValuePair<string, object> item in routes.GetHealthDetails()) details[item.Key] = item.Value;
+            foreach (KeyValuePair<string, object> item in proxy.GetHealthDetails()) details[item.Key] = item.Value;
+            return details;
+        }
     }
 
     internal static class LegacyCleanup
@@ -1505,6 +2536,63 @@ namespace FastLinkDirectTool
         }
     }
 
+    internal sealed class NetworkRefreshPolicy
+    {
+        private string candidate;
+        private DateTime candidateSinceUtc;
+        public bool Paused { get; private set; }
+
+        internal static bool CanWork(bool busy, bool enabled, bool cleanupPending)
+        {
+            return !busy && enabled && !cleanupPending;
+        }
+
+        public bool Observe(string current, string target, DateTime nowUtc)
+        {
+            if (Paused) return false;
+            if (string.IsNullOrEmpty(target) || string.Equals(current, target, StringComparison.Ordinal))
+            {
+                ResetCandidate();
+                return false;
+            }
+            if (!string.Equals(candidate, target, StringComparison.Ordinal))
+            {
+                candidate = target;
+                candidateSinceUtc = nowUtc;
+                return false;
+            }
+            return nowUtc - candidateSinceUtc >= TimeSpan.FromSeconds(8);
+        }
+
+        public void ResetCandidate() { candidate = null; }
+        public void Pause() { Paused = true; ResetCandidate(); }
+        public void Reset() { Paused = false; ResetCandidate(); }
+    }
+
+    // Accessed only on the UI thread. Completing an older snapshot must not
+    // acknowledge edits made while that snapshot was being applied.
+    internal sealed class RuleRefreshQueue
+    {
+        public long RequestedRevision { get; private set; }
+        public long AppliedRevision { get; private set; }
+        public bool Paused { get; private set; }
+        public bool HasPending { get { return RequestedRevision > AppliedRevision; } }
+
+        public void Request() { RequestedRevision++; }
+
+        public bool CanApply(bool busy, bool enabled, bool cleanupPending)
+        {
+            return HasPending && !Paused && NetworkRefreshPolicy.CanWork(busy, enabled, cleanupPending);
+        }
+
+        public void Complete(long revision, bool succeeded)
+        {
+            if (!succeeded) { Paused = true; return; }
+            AppliedRevision = Math.Max(AppliedRevision, revision);
+            Paused = false;
+        }
+    }
+
     internal sealed class MainForm : Form
     {
         private readonly AppConfig config;
@@ -1518,6 +2606,7 @@ namespace FastLinkDirectTool
         private readonly CheckBox autoEnable;
         private readonly CheckBox autoStart;
         private readonly CheckBox directPrivateNetworks;
+        private readonly CheckBox autoRestartFastLink;
         private readonly ListBox ruleList;
         private readonly TextBox ruleInput;
         private readonly TextBox logBox;
@@ -1527,9 +2616,29 @@ namespace FastLinkDirectTool
         private bool allowExit;
         private DateTime physicalNetworkMissingSince = DateTime.MinValue;
         private DateTime nextNetworkRecoveryAllowed = DateTime.MinValue;
+        private bool proxyHealthCheckInProgress;
+        private int consecutiveProxyHealthFailures;
+        private DateTime nextProxyHealthCheck = DateTime.MinValue;
+        private DateTime nextProxyRecoveryAllowed = DateTime.Now.AddMinutes(5);
+        private DateTime lastProxyRecoveryCompleted = DateTime.MinValue;
+        private DateTime proxyHealthFailureSince = DateTime.MinValue;
+        private string proxyIncidentId;
+        private int routeMaintenanceInProgress;
+        private int systemProxyMaintenanceInProgress;
+        private DateTime nextSystemProxyMaintenance = DateTime.MinValue;
+        private DateTime nextRouteMaintenance = DateTime.MinValue;
+        private int healthHeartbeatInProgress;
+        private DateTime nextHealthHeartbeat = DateTime.Now.AddMinutes(1);
+        private DateTime nextEnableAllowed = DateTime.MinValue;
+        private readonly NetworkRefreshPolicy networkRefreshPolicy = new NetworkRefreshPolicy();
+        private readonly RuleRefreshQueue ruleRefreshQueue = new RuleRefreshQueue();
+        private bool dualModeSessionSuppressed;
+        private bool dualRecoveryPending;
+        private bool prepareNetworkModeOnce;
 
-        public MainForm(bool autoStartLaunch)
+        public MainForm(bool autoStartLaunch, bool openNetworkMode = false, bool prepareNetworkMode = false)
         {
+            prepareNetworkModeOnce = !autoStartLaunch && openNetworkMode && prepareNetworkMode;
             Text = "FastLink 直连助手";
             AppLogger.Log("UI process started. AutoStartLaunch=" + autoStartLaunch);
             Icon = SystemIcons.Shield;
@@ -1540,6 +2649,11 @@ namespace FastLinkDirectTool
 
             config = ConfigStore.Load();
             runtime = new RuntimeController();
+            HealthEventLogger.Write("app_start", new Dictionary<string, object>
+            {
+                { "version", Assembly.GetExecutingAssembly().GetName().Version.ToString() },
+                { "autostart", autoStartLaunch }
+            });
 
             TableLayoutPanel root = new TableLayoutPanel();
             root.Dock = DockStyle.Fill;
@@ -1547,7 +2661,7 @@ namespace FastLinkDirectTool
             root.ColumnCount = 1;
             root.RowCount = 5;
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 112));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 78));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 112));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 82));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 88));
@@ -1557,11 +2671,30 @@ namespace FastLinkDirectTool
             statusPanel.Dock = DockStyle.Fill;
             statusPanel.BackColor = Color.FromArgb(245, 247, 250);
             fastLinkStatus = NewStatusLabel("Fastlink：检测中…", 14);
-            directStatus = NewStatusLabel("直连模式：关闭", 42);
-            networkStatus = NewStatusLabel("物理网络：尚未识别", 70);
+            directStatus = NewStatusLabel("模式一（FastLink 分流）：关闭", 42);
+            networkStatus = NewStatusLabel("物理网络：尚未识别", 78);
             statusPanel.Controls.Add(fastLinkStatus);
             statusPanel.Controls.Add(directStatus);
             statusPanel.Controls.Add(networkStatus);
+            Button networkModes = new Button();
+            networkModes.Text = "工作模式（1 / 2 / 3）";
+            networkModes.Size = new Size(190, 30);
+            networkModes.Left = 14; networkModes.Top = 8;
+            Button exitAssistant = new Button();
+            exitAssistant.Text = "退出助手（自动清理）";
+            exitAssistant.Size = new Size(190, 28);
+            exitAssistant.Left = 14; exitAssistant.Top = 44;
+            exitAssistant.Click += delegate { ExitAndClean(); };
+            statusPanel.Resize += delegate
+            {
+                networkModes.Left = Math.Max(14, statusPanel.ClientSize.Width - 204);
+                exitAssistant.Left = networkModes.Left;
+                fastLinkStatus.Width = Math.Max(80, networkModes.Left - fastLinkStatus.Left - 12);
+                directStatus.Width = Math.Max(80, exitAssistant.Left - directStatus.Left - 12);
+            };
+            networkModes.Click += delegate { OpenDualNetworkMode(); };
+            statusPanel.Controls.Add(networkModes);
+            statusPanel.Controls.Add(exitAssistant);
             root.Controls.Add(statusPanel, 0, 0);
 
             FlowLayoutPanel switchPanel = new FlowLayoutPanel();
@@ -1598,6 +2731,20 @@ namespace FastLinkDirectTool
                 RestartForRuleChange();
             };
             switchPanel.Controls.Add(directPrivateNetworks);
+            autoRestartFastLink = new CheckBox();
+            autoRestartFastLink.Text = "网络异常时自动重启 FastLink（默认关闭）";
+            autoRestartFastLink.AutoSize = true;
+            autoRestartFastLink.Padding = new Padding(12, 10, 0, 0);
+            autoRestartFastLink.Checked = config.AutoRestartFastLink;
+            autoRestartFastLink.CheckedChanged += delegate
+            {
+                config.AutoRestartFastLink = autoRestartFastLink.Checked;
+                ConfigStore.Save(config);
+                SafeLog(autoRestartFastLink.Checked
+                    ? "已允许网络异常时自动重启 FastLink。"
+                    : "已关闭 FastLink 自动重启；异常只记录日志。");
+            };
+            switchPanel.Controls.Add(autoRestartFastLink);
             autoStart = new CheckBox();
             autoStart.Text = "Windows 登录后自启动";
             autoStart.AutoSize = true;
@@ -1666,9 +2813,14 @@ namespace FastLinkDirectTool
 
             ContextMenuStrip trayMenu = new ContextMenuStrip();
             trayMenu.Items.Add("打开界面", null, delegate { ShowFromTray(); });
+            trayMenu.Items.Add("工作模式（1 / 2 / 3）", null, delegate { ShowFromTray(); OpenDualNetworkMode(); });
             trayMenu.Items.Add("打开运行日志", null, delegate
             {
                 try { Process.Start("notepad.exe", AppLogger.LogPath); } catch { }
+            });
+            trayMenu.Items.Add("打开健康日志", null, delegate
+            {
+                try { Process.Start("notepad.exe", HealthEventLogger.LogPath); } catch { }
             });
             trayMenu.Items.Add("退出并清理", null, delegate { ExitAndClean(); });
             trayIcon = new NotifyIcon();
@@ -1680,18 +2832,42 @@ namespace FastLinkDirectTool
 
             Shown += delegate
             {
+                busy = true;
                 Task.Run(delegate
                 {
-                    try
+                    // Recovery detection only: do not resume either mode across a
+                    // crashed dual-network transaction or corrupt ownership file.
+                    var dualRecovery = new Modes.DualNetworkRuntime(new Modes.DualNetworkWindowsPlatform(),
+                        new Modes.DualFileJournal(), new Modes.DualNetworkDns());
+                    dualRecoveryPending = dualRecovery.HasPending || dualRecovery.IsArmed || dualRecovery.IsActive;
+                    if (dualRecoveryPending)
                     {
-                        runtime.InitializeAndCleanLegacy();
-                        if (config.AutoStart && !StartupTask.IsInstalled()) StartupTask.Install();
+                        dualModeSessionSuppressed = true;
+                        throw new InvalidOperationException("发现双网模式待恢复记录；请打开“工作模式（1 / 2 / 3）”执行恢复清理。旧模式已暂停。");
                     }
-                    catch (Exception ex) { SafeLog("初始化失败：" + ex.Message); }
-                }).ContinueWith(delegate
+                    runtime.InitializeAndCleanLegacy();
+                    if (config.AutoStart && !StartupTask.IsInstalled()) StartupTask.Install();
+                }).ContinueWith(delegate(Task task)
                 {
                     BeginInvoke((Action)delegate
                     {
+                        busy = false;
+                        if (task.IsFaulted)
+                        {
+                            dualModeSessionSuppressed = true;
+                            string message = "初始化清理失败，已停止自动开启：" + task.Exception.GetBaseException().Message;
+                            SafeLog(message);
+                            trayIcon.ShowBalloonTip(5000, "FastLink 直连助手", message, ToolTipIcon.Error);
+                            RefreshUi();
+                            if (openNetworkMode && dualRecoveryPending) BeginInvoke((Action)OpenDualNetworkMode);
+                            return;
+                        }
+                        if (openNetworkMode)
+                        {
+                            dualModeSessionSuppressed = true;
+                            BeginInvoke((Action)OpenDualNetworkMode);
+                            return;
+                        }
                         monitorTimer.Start();
                         CheckFastLink();
                     });
@@ -1706,12 +2882,16 @@ namespace FastLinkDirectTool
                     e.Cancel = true;
                     HideToTray();
                 }
+                else if (!allowExit)
+                {
+                    e.Cancel = true;
+                    ExitAndClean();
+                }
             };
             FormClosed += delegate
             {
                 monitorTimer.Stop();
                 trayIcon.Visible = false;
-                try { runtime.Disable(); } catch { }
             };
 
             monitorTimer = new System.Windows.Forms.Timer();
@@ -1719,7 +2899,9 @@ namespace FastLinkDirectTool
             monitorTimer.Tick += delegate
             {
                 CheckFastLink();
-                if (runtime.Enabled) Task.Run(delegate { runtime.RemoveExpiredRoutes(); });
+                QueueRouteMaintenance();
+                QueueSystemProxyMaintenance();
+                QueueHealthHeartbeat();
             };
         }
 
@@ -1735,60 +2917,224 @@ namespace FastLinkDirectTool
             return label;
         }
 
+        private void QueueRouteMaintenance()
+        {
+            if (!NetworkRefreshPolicy.CanWork(busy, runtime.Enabled, runtime.CleanupPending) || DateTime.Now < nextRouteMaintenance) return;
+            if (Interlocked.CompareExchange(ref routeMaintenanceInProgress, 1, 0) != 0) return;
+            nextRouteMaintenance = DateTime.Now.AddMinutes(1);
+            Task.Run(delegate { runtime.RemoveExpiredRoutes(); }).ContinueWith(delegate(Task task)
+            {
+                Interlocked.Exchange(ref routeMaintenanceInProgress, 0);
+                if (task.IsFaulted)
+                {
+                    HealthEventLogger.Write("route_maintenance_failed", new Dictionary<string, object>
+                    {
+                        { "error", task.Exception.GetBaseException().Message }
+                    });
+                }
+            });
+        }
+
+        private void QueueSystemProxyMaintenance()
+        {
+            if (!NetworkRefreshPolicy.CanWork(busy, runtime.Enabled, runtime.CleanupPending) ||
+                DateTime.Now < nextSystemProxyMaintenance || !FastLinkConnectionCompatibility.GetCurrent().Active) return;
+            if (Interlocked.CompareExchange(ref systemProxyMaintenanceInProgress, 1, 0) != 0) return;
+            nextSystemProxyMaintenance = DateTime.Now.AddSeconds(10);
+            Task.Run(delegate { runtime.MaintainSystemProxyBypass(); }).ContinueWith(delegate(Task task)
+            {
+                Interlocked.Exchange(ref systemProxyMaintenanceInProgress, 0);
+                if (task.IsFaulted)
+                {
+                    string message = "系统代理例外维护失败，已暂停重试：" + task.Exception.GetBaseException().Message;
+                    SafeLog(message);
+                    HealthEventLogger.Write("system_proxy_bypass_failed", new Dictionary<string, object> { { "error", message } });
+                }
+            });
+        }
+
+        private void QueueHealthHeartbeat()
+        {
+            if (DateTime.Now < nextHealthHeartbeat) return;
+            if (Interlocked.CompareExchange(ref healthHeartbeatInProgress, 1, 0) != 0) return;
+            nextHealthHeartbeat = DateTime.Now.AddMinutes(5);
+            Task.Run(delegate
+            {
+                HealthEventLogger.Write("health_heartbeat", BuildHealthDetails());
+            }).ContinueWith(delegate { Interlocked.Exchange(ref healthHeartbeatInProgress, 0); });
+        }
+
+        private IDictionary<string, object> BuildHealthDetails()
+        {
+            Dictionary<string, object> details = new Dictionary<string, object>();
+            try
+            {
+                foreach (KeyValuePair<string, object> item in runtime.GetHealthDetails()) details[item.Key] = item.Value;
+            }
+            catch (Exception ex) { details["runtime_snapshot_error"] = ex.Message; }
+
+            details["fastlink_adapter_active"] = NetworkDetector.IsLegacyTunnelActive();
+            FastLinkConnectionInfo compatibility = FastLinkConnectionCompatibility.GetCurrent();
+            details["fastlink_system_proxy_active"] = compatibility.Active;
+            details["fastlink_connection_mode"] = compatibility.Active ? "system_proxy" :
+                (NetworkDetector.IsLegacyTunnelActive() ? "tun" : "inactive");
+            try
+            {
+                Process[] fastLink = Process.GetProcessesByName("FastLink");
+                Process[] cores = Process.GetProcessesByName("FastLinkCore");
+                if (compatibility.Active && compatibility.CoreName == "ApexCore")
+                    cores = cores.Concat(Process.GetProcessesByName("ApexCore")).ToArray();
+                details["fastlink_process_count"] = fastLink.Length;
+                details["fastlink_core_count"] = cores.Length;
+                if (cores.Length > 0)
+                {
+                    details["fastlink_core_pid"] = cores[0].Id;
+                    try { details["fastlink_core_working_set_mb"] = Math.Round(cores[0].WorkingSet64 / 1048576.0, 1); } catch { }
+                }
+                foreach (Process process in fastLink) process.Dispose();
+                foreach (Process process in cores) process.Dispose();
+            }
+            catch (Exception ex) { details["fastlink_process_error"] = ex.Message; }
+
+            try
+            {
+                TcpConnectionInformation[] connections = IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpConnections();
+                int nodeSessions = connections.Count(
+                    delegate(TcpConnectionInformation connection)
+                    {
+                        return connection.State == TcpState.Established &&
+                            (connection.RemoteEndPoint.Port == 10131 || connection.RemoteEndPoint.Port == 10141 || connection.RemoteEndPoint.Port == 10151);
+                    });
+                int nodeConnecting = connections.Count(delegate(TcpConnectionInformation connection)
+                {
+                    return connection.State == TcpState.SynSent &&
+                        (connection.RemoteEndPoint.Port == 10131 || connection.RemoteEndPoint.Port == 10141 || connection.RemoteEndPoint.Port == 10151);
+                });
+                int outboundConnecting = connections.Count(delegate(TcpConnectionInformation connection)
+                {
+                    return connection.State == TcpState.SynSent && connection.RemoteEndPoint.Port == 443;
+                });
+                details["fastlink_node_sessions"] = nodeSessions;
+                details["fastlink_node_connecting"] = nodeConnecting;
+                details["outbound_443_connecting"] = outboundConnecting;
+            }
+            catch (Exception ex) { details["node_session_error"] = ex.Message; }
+            return details;
+        }
+
+        private static void AddProbeDetails(IDictionary<string, object> details, ProxyProbeResult probe)
+        {
+            if (probe == null) return;
+            details["probe_healthy"] = probe.Healthy;
+            details["probe_timed_out"] = probe.TimedOut;
+            details["probe_status_code"] = probe.StatusCode;
+            details["probe_elapsed_ms"] = probe.ElapsedMilliseconds;
+            details["probe_error"] = probe.Error ?? string.Empty;
+        }
+
+        private void ClearProxyIncident()
+        {
+            consecutiveProxyHealthFailures = 0;
+            proxyHealthFailureSince = DateTime.MinValue;
+            proxyIncidentId = null;
+        }
+
         private void CheckFastLink()
         {
-            if (busy) return;
+            if (busy || dualModeSessionSuppressed || dualRecoveryPending) return;
             bool active = NetworkDetector.IsFastLinkActive();
-            fastLinkStatus.Text = active ? "Fastlink：已接通" : "Fastlink：未接通";
+            FastLinkConnectionInfo connection = FastLinkConnectionCompatibility.GetCurrent();
+            fastLinkStatus.Text = active ? (connection.Active ? "Fastlink：已接通（系统代理）" : "Fastlink：已接通（虚拟网卡）") : "Fastlink：未接通";
             fastLinkStatus.ForeColor = active ? Color.DarkGreen : Color.DimGray;
 
-            if (active && runtime.Enabled && runtime.Network != null &&
-                !FastLinkRecovery.IsPhysicalNetworkUsable(runtime.Network.InterfaceName))
+            // DNS must stay alive in this state, but no background operation may
+            // repeat a partially completed cleanup, rule apply, or route removal.
+            if (runtime.CleanupPending)
             {
-                if (physicalNetworkMissingSince == DateTime.MinValue)
-                {
-                    physicalNetworkMissingSince = DateTime.Now;
-                    SafeLog("检测到物理网络失去有效 IP，正在观察…");
-                }
-                networkStatus.Text = "物理网络：连接异常，等待自动恢复";
-                networkStatus.ForeColor = Color.DarkOrange;
-                if (DateTime.Now - physicalNetworkMissingSince >= TimeSpan.FromSeconds(8) &&
-                    DateTime.Now >= nextNetworkRecoveryAllowed)
-                {
-                    BeginFastLinkRecovery();
-                }
                 lastFastLinkActive = active;
+                RefreshUi();
                 return;
             }
-            physicalNetworkMissingSince = DateTime.MinValue;
-            networkStatus.ForeColor = SystemColors.ControlText;
 
+            PhysicalNetworkInfo currentNetwork = null;
             if (active && runtime.Enabled && runtime.Network != null)
             {
-                PhysicalNetworkInfo currentNetwork = NetworkDetector.Detect();
+                currentNetwork = NetworkDetector.Detect();
                 if (currentNetwork != null &&
                     !string.Equals(currentNetwork.Identity, runtime.Network.Identity, StringComparison.Ordinal))
                 {
-                    BeginPhysicalNetworkRefresh();
+                    physicalNetworkMissingSince = DateTime.MinValue;
+                    ClearProxyIncident();
+                    if (networkRefreshPolicy.Observe(runtime.Network.Identity, currentNetwork.Identity, DateTime.UtcNow))
+                        BeginPhysicalNetworkRefresh();
+                    lastFastLinkActive = active;
+                    return;
+                }
+
+                networkRefreshPolicy.ResetCandidate();
+                if (currentNetwork == null)
+                {
+                    ClearProxyIncident();
+                    if (physicalNetworkMissingSince == DateTime.MinValue)
+                    {
+                        physicalNetworkMissingSince = DateTime.Now;
+                        SafeLog("检测到物理网络失去有效 IP，正在观察…");
+                    }
+                    networkStatus.Text = "物理网络：连接异常，等待自动恢复";
+                    networkStatus.ForeColor = Color.DarkOrange;
+                    if (DateTime.Now - physicalNetworkMissingSince >= TimeSpan.FromSeconds(12) &&
+                        DateTime.Now >= nextNetworkRecoveryAllowed)
+                    {
+                        PhysicalNetworkInfo replacement = NetworkDetector.Detect();
+                        if (replacement != null)
+                        {
+                            physicalNetworkMissingSince = DateTime.MinValue;
+                            // Let the next tick observe and stabilize the replacement.
+                            networkRefreshPolicy.ResetCandidate();
+                        }
+                        else if (CanAutomaticallyRecoverFastLink())
+                        {
+                            BeginFastLinkRecovery();
+                        }
+                        else if (DateTime.Now >= nextNetworkRecoveryAllowed)
+                        {
+                            nextNetworkRecoveryAllowed = DateTime.Now.AddMinutes(10);
+                            SafeLog("物理网络持续异常；FastLink 自动重启已关闭，仅记录监控。");
+                            HealthEventLogger.Write("network_recovery_suppressed", new Dictionary<string, object>
+                            {
+                                { "reason", "user_disabled" },
+                                { "failure_duration_seconds", Math.Round((DateTime.Now - physicalNetworkMissingSince).TotalSeconds, 1) }
+                            });
+                        }
+                    }
                     lastFastLinkActive = active;
                     return;
                 }
             }
+            physicalNetworkMissingSince = DateTime.MinValue;
+            networkStatus.ForeColor = SystemColors.ControlText;
 
             if (!active)
             {
+                ClearProxyIncident();
                 manualOffUntilReconnect = false;
                 if (runtime.Enabled) BeginDisable("Fastlink 已断开，直连规则已自动清理。");
             }
-            else if (!lastFastLinkActive && config.AutoEnableWithFastLink && !manualOffUntilReconnect)
+            else if (!lastFastLinkActive && config.AutoEnableWithFastLink && !manualOffUntilReconnect && !runtime.CleanupPending)
             {
+                networkRefreshPolicy.Reset();
                 if (NetworkDetector.Detect() != null)
                     BeginEnable("检测到 Fastlink，正在自动开启直连…");
             }
-            else if (active && config.AutoEnableWithFastLink && !runtime.Enabled && !manualOffUntilReconnect)
+            else if (active && config.AutoEnableWithFastLink && !runtime.Enabled && !manualOffUntilReconnect && !runtime.CleanupPending)
             {
                 if (NetworkDetector.Detect() != null)
                     BeginEnable("正在自动开启直连…");
+            }
+            else if (active && runtime.Enabled && currentNetwork != null)
+            {
+                ApplyPendingRuleChanges();
+                if (!busy) QueueProxyHealthCheck();
             }
             lastFastLinkActive = active;
             RefreshUi();
@@ -1796,26 +3142,44 @@ namespace FastLinkDirectTool
 
         private void BeginPhysicalNetworkRefresh()
         {
-            if (busy || !runtime.Enabled) return;
+            if (!NetworkRefreshPolicy.CanWork(busy, runtime.Enabled, runtime.CleanupPending) || networkRefreshPolicy.Paused) return;
             busy = true;
             RuleSet rules = CurrentRules();
+            long rulesRevision = ruleRefreshQueue.RequestedRevision;
+            bool privateNetworks = config.DirectPrivateNetworks;
+            Stopwatch refreshWatch = Stopwatch.StartNew();
+            HealthEventLogger.Write("network_refresh_started", new Dictionary<string, object>
+            {
+                { "previous_network", runtime.Network == null ? string.Empty : runtime.Network.Identity },
+                { "rule_count", rules.NormalizedRules.Count }
+            });
             SafeLog("检测到 Wi-Fi、DNS 或网关变化，正在刷新直连规则…");
             Task.Run(delegate
             {
-                runtime.Restart(rules, config.DirectPrivateNetworks);
+                runtime.Restart(rules, privateNetworks);
             }).ContinueWith(delegate(Task task)
             {
                 BeginInvoke((Action)delegate
                 {
                     busy = false;
+                    ruleRefreshQueue.Complete(rulesRevision, !task.IsFaulted);
                     if (task.IsFaulted)
                     {
-                        string message = "网络切换后刷新失败：" + task.Exception.GetBaseException().Message;
+                        networkRefreshPolicy.Pause();
+                        manualOffUntilReconnect = true;
+                        string message = "网络切换后刷新失败，已暂停自动重试；请点击主开关处理：" + task.Exception.GetBaseException().Message;
                         SafeLog(message);
+                        HealthEventLogger.Write("network_refresh_failed", new Dictionary<string, object>
+                        {
+                            { "elapsed_ms", refreshWatch.ElapsedMilliseconds }, { "cleanup_pending", runtime.CleanupPending },
+                            { "auto_retry_paused", true }, { "error", task.Exception.GetBaseException().Message }
+                        });
                         trayIcon.ShowBalloonTip(5000, "FastLink 直连助手", message, ToolTipIcon.Error);
                     }
                     else
                     {
+                        networkRefreshPolicy.Reset();
+                        HealthEventLogger.Write("network_refresh_completed", new Dictionary<string, object> { { "elapsed_ms", refreshWatch.ElapsedMilliseconds } });
                         SafeLog("网络已切换，直连规则已刷新。");
                     }
                     RefreshUi();
@@ -1823,19 +3187,230 @@ namespace FastLinkDirectTool
             });
         }
 
+        private void QueueProxyHealthCheck()
+        {
+            if (proxyHealthCheckInProgress || DateTime.Now < nextProxyHealthCheck) return;
+            proxyHealthCheckInProgress = true;
+            nextProxyHealthCheck = DateTime.Now.AddSeconds(25);
+
+            Task.Run(delegate
+            {
+                return ProxyHealthProbe.Probe();
+            }).ContinueWith(delegate(Task<ProxyProbeResult> task)
+            {
+                try
+                {
+                    BeginInvoke((Action)delegate
+                    {
+                        proxyHealthCheckInProgress = false;
+                        if (!NetworkDetector.IsFastLinkActive() || !runtime.Enabled)
+                        {
+                            ClearProxyIncident();
+                            return;
+                        }
+
+                        ProxyProbeResult probe = task.IsFaulted ? new ProxyProbeResult
+                        {
+                            Healthy = false,
+                            Error = task.Exception.GetBaseException().Message
+                        } : task.Result;
+                        if (probe.Healthy)
+                        {
+                            if (consecutiveProxyHealthFailures > 0)
+                            {
+                                SafeLog("FastLink 代理健康检查已恢复。");
+                                Dictionary<string, object> recovered = new Dictionary<string, object>();
+                                recovered["incident_id"] = proxyIncidentId ?? string.Empty;
+                                recovered["failure_count"] = consecutiveProxyHealthFailures;
+                                recovered["failure_duration_seconds"] = proxyHealthFailureSince == DateTime.MinValue
+                                    ? 0 : Math.Round((DateTime.Now - proxyHealthFailureSince).TotalSeconds, 1);
+                                AddProbeDetails(recovered, probe);
+                                HealthEventLogger.Write("proxy_probe_recovered", recovered);
+                            }
+                            ClearProxyIncident();
+                            return;
+                        }
+
+                        if (proxyHealthFailureSince == DateTime.MinValue)
+                        {
+                            proxyHealthFailureSince = DateTime.Now;
+                            proxyIncidentId = Guid.NewGuid().ToString("N");
+                        }
+                        consecutiveProxyHealthFailures++;
+                        Dictionary<string, object> failed = new Dictionary<string, object>();
+                        failed["incident_id"] = proxyIncidentId;
+                        failed["failure_count"] = consecutiveProxyHealthFailures;
+                        failed["failure_duration_seconds"] = Math.Round((DateTime.Now - proxyHealthFailureSince).TotalSeconds, 1);
+                        AddProbeDetails(failed, probe);
+                        HealthEventLogger.Write("proxy_probe_failed", failed);
+                        if (consecutiveProxyHealthFailures == 1)
+                            SafeLog("FastLink 显示已连接，但代理访问失败，正在复核…");
+
+                        if (consecutiveProxyHealthFailures >= 3 &&
+                            DateTime.Now >= nextProxyRecoveryAllowed &&
+                            !busy && CanAutomaticallyRecoverFastLink())
+                        {
+                            BeginProxyRecovery();
+                        }
+                        else if (consecutiveProxyHealthFailures >= 3 &&
+                            !config.AutoRestartFastLink &&
+                            (consecutiveProxyHealthFailures == 3 || consecutiveProxyHealthFailures % 12 == 0))
+                        {
+                            SafeLog("代理持续异常；FastLink 自动重启已关闭，仅记录监控。");
+                            HealthEventLogger.Write("proxy_recovery_suppressed", new Dictionary<string, object>
+                            {
+                                { "incident_id", proxyIncidentId ?? string.Empty },
+                                { "failure_count", consecutiveProxyHealthFailures },
+                                { "failure_duration_seconds", Math.Round((DateTime.Now - proxyHealthFailureSince).TotalSeconds, 1) },
+                                { "reason", "user_disabled" }
+                            });
+                        }
+                    });
+                }
+                catch
+                {
+                    proxyHealthCheckInProgress = false;
+                }
+            });
+        }
+
+        private bool CanAutomaticallyRecoverFastLink()
+        {
+            return config.AutoRestartFastLink && NetworkDetector.IsLegacyTunnelActive() &&
+                FastLinkConnectionCompatibility.CanUseLegacyRecovery();
+        }
+
+        private void BeginProxyRecovery()
+        {
+            if (!CanAutomaticallyRecoverFastLink() || busy || runtime.Network == null) return;
+            busy = true;
+            nextProxyRecoveryAllowed = DateTime.Now.AddMinutes(5);
+            nextProxyHealthCheck = DateTime.Now.AddMinutes(1);
+            string interfaceName = runtime.Network.InterfaceName;
+            string originalIdentity = runtime.Network.Identity;
+            RuleSet rules = CurrentRules();
+            string incidentId = proxyIncidentId ?? Guid.NewGuid().ToString("N");
+            double failureDuration = proxyHealthFailureSince == DateTime.MinValue
+                ? 0 : (DateTime.Now - proxyHealthFailureSince).TotalSeconds;
+            SafeLog("代理连续检测失败，正在自动重启 FastLink 核心…");
+            HealthEventLogger.Write("proxy_recovery_started", new Dictionary<string, object>
+            {
+                { "incident_id", incidentId },
+                { "failure_count", consecutiveProxyHealthFailures },
+                { "failure_duration_seconds", Math.Round(failureDuration, 1) },
+                { "strategy", "restart_fastlink_keep_direct_rules" },
+                { "physical_interface", interfaceName }
+            });
+
+            Task.Run(delegate
+            {
+                Stopwatch stopwatch = Stopwatch.StartNew();
+                FastLinkRecoveryResult recovery = FastLinkRecovery.RestartFastLink(interfaceName);
+                if (recovery.FastLinkRecovered)
+                {
+                    ProxyProbeResult verification = null;
+                    int consecutiveHealthy = 0;
+                    for (int attempt = 0; attempt < 6; attempt++)
+                    {
+                        verification = ProxyHealthProbe.Probe();
+                        if (verification.Healthy) consecutiveHealthy++;
+                        else consecutiveHealthy = 0;
+                        if (consecutiveHealthy >= 2) break;
+                        if (attempt < 5) Thread.Sleep(3000);
+                    }
+                    recovery.ProxyProbe = verification;
+                    recovery.ProxyVerificationSuccesses = consecutiveHealthy;
+                    if (verification == null || consecutiveHealthy < 2)
+                    {
+                        recovery.FastLinkRecovered = false;
+                        recovery.Detail = "FastLink restarted, but two consecutive proxy checks did not succeed.";
+                    }
+                    else
+                    {
+                        PhysicalNetworkInfo detected = NetworkDetector.Detect();
+                        if (detected != null && !string.Equals(detected.Identity, originalIdentity, StringComparison.Ordinal))
+                        {
+                            runtime.Restart(rules, config.DirectPrivateNetworks);
+                            recovery.DirectRulesRebuilt = true;
+                        }
+                    }
+                }
+                stopwatch.Stop();
+                recovery.RecoveryElapsedMilliseconds = stopwatch.ElapsedMilliseconds;
+                return recovery;
+            }).ContinueWith(delegate(Task<FastLinkRecoveryResult> task)
+            {
+                BeginInvoke((Action)delegate
+                {
+                    busy = false;
+                    if (task.IsFaulted)
+                    {
+                        string message = "代理自动恢复失败：" + task.Exception.GetBaseException().Message;
+                        SafeLog(message);
+                        HealthEventLogger.Write("proxy_recovery_failed", new Dictionary<string, object>
+                        {
+                            { "incident_id", incidentId },
+                            { "error", task.Exception.GetBaseException().Message }
+                        });
+                        trayIcon.ShowBalloonTip(6000, "FastLink 直连助手", message, ToolTipIcon.Error);
+                    }
+                    else if (task.Result.FastLinkRecovered && runtime.Enabled)
+                    {
+                        lastProxyRecoveryCompleted = DateTime.Now;
+                        nextProxyRecoveryAllowed = DateTime.Now.AddMinutes(5);
+                        SafeLog(task.Result.DirectRulesRebuilt
+                            ? "FastLink 核心已恢复；因网络发生变化，直连规则也已刷新。"
+                            : "FastLink 核心已自动恢复，直连规则全程保持可用。");
+                        Dictionary<string, object> completed = new Dictionary<string, object>();
+                        completed["incident_id"] = incidentId;
+                        completed["recovery_elapsed_ms"] = task.Result.RecoveryElapsedMilliseconds;
+                        completed["direct_rules_rebuilt"] = task.Result.DirectRulesRebuilt;
+                        completed["verification_successes"] = task.Result.ProxyVerificationSuccesses;
+                        completed["detail"] = task.Result.Detail ?? string.Empty;
+                        AddProbeDetails(completed, task.Result.ProxyProbe);
+                        HealthEventLogger.Write("proxy_recovery_completed", completed);
+                        trayIcon.ShowBalloonTip(5000, "FastLink 直连助手",
+                            "检测到代理假连接，FastLink 已自动重启", ToolTipIcon.Info);
+                    }
+                    else
+                    {
+                        nextProxyRecoveryAllowed = DateTime.Now.AddMinutes(10);
+                        SafeLog("代理自动恢复未成功：" + task.Result.Detail);
+                        Dictionary<string, object> failed = new Dictionary<string, object>();
+                        failed["incident_id"] = incidentId;
+                        failed["recovery_elapsed_ms"] = task.Result.RecoveryElapsedMilliseconds;
+                        failed["detail"] = task.Result.Detail ?? string.Empty;
+                        failed["verification_successes"] = task.Result.ProxyVerificationSuccesses;
+                        AddProbeDetails(failed, task.Result.ProxyProbe);
+                        HealthEventLogger.Write("proxy_recovery_failed", failed);
+                        trayIcon.ShowBalloonTip(7000, "FastLink 直连助手",
+                            "FastLink 仍不可用，请检查节点或服务状态。", ToolTipIcon.Warning);
+                    }
+                    ClearProxyIncident();
+                    RefreshUi();
+                });
+            });
+        }
+
         private void BeginFastLinkRecovery()
         {
-            if (busy || runtime.Network == null) return;
+            if (!CanAutomaticallyRecoverFastLink() || busy || runtime.Network == null) return;
             busy = true;
             nextNetworkRecoveryAllowed = DateTime.Now.AddMinutes(5);
             string interfaceName = runtime.Network.InterfaceName;
+            string interfaceId = runtime.Network.InterfaceId;
+            string preferredWifiSsid = runtime.Network.WifiSsid;
+            string preferredWifiProfile = runtime.Network.WifiProfile;
             RuleSet rules = CurrentRules();
-            SafeLog("正在自动重启 FastLink 并恢复 WLAN…");
+            SafeLog(string.IsNullOrWhiteSpace(preferredWifiSsid)
+                ? "正在自动重启 FastLink 并恢复 WLAN…"
+                : "正在恢复原 Wi-Fi（" + preferredWifiSsid + "）并重启 FastLink…");
 
             Task.Run(delegate
             {
                 runtime.Disable();
-                FastLinkRecoveryResult recovery = FastLinkRecovery.Recover(interfaceName);
+                FastLinkRecoveryResult recovery = FastLinkRecovery.Recover(
+                    interfaceName, interfaceId, preferredWifiSsid, preferredWifiProfile);
                 if (recovery.FastLinkRecovered)
                     runtime.Enable(rules, config.DirectPrivateNetworks);
                 return recovery;
@@ -1850,6 +3425,15 @@ namespace FastLinkDirectTool
                         string message = "自动恢复失败：" + task.Exception.GetBaseException().Message;
                         SafeLog(message);
                         trayIcon.ShowBalloonTip(5000, "FastLink 直连助手", message, ToolTipIcon.Error);
+                    }
+                    else if (task.Result.FastLinkRecovered && runtime.Enabled && task.Result.UsedFallbackWifi)
+                    {
+                        string fallback = string.IsNullOrWhiteSpace(task.Result.RecoveredWifiSsid)
+                            ? "其他 Wi-Fi" : task.Result.RecoveredWifiSsid;
+                        SafeLog("原 Wi-Fi 暂不可用，当前临时连接到 " + fallback + "。");
+                        trayIcon.ShowBalloonTip(7000, "FastLink 直连助手",
+                            "已临时连接 " + fallback + "；原 Wi-Fi " +
+                            task.Result.PreferredWifiSsid + " 暂不可用。", ToolTipIcon.Warning);
                     }
                     else if (task.Result.FastLinkRecovered && runtime.Enabled)
                     {
@@ -1876,7 +3460,16 @@ namespace FastLinkDirectTool
 
         private void MainSwitchChanged(object sender, EventArgs e)
         {
+            if (dualRecoveryPending) { SafeLog("请先在双网模式窗口完成恢复清理。"); return; }
+            if (!busy) dualModeSessionSuppressed = false;
             if (busy) return;
+            networkRefreshPolicy.Reset();
+            if (runtime.CleanupPending)
+            {
+                manualOffUntilReconnect = true;
+                BeginDisable("残留清理已完成。");
+                return;
+            }
             if (mainSwitch.Checked)
             {
                 manualOffUntilReconnect = false;
@@ -1896,20 +3489,25 @@ namespace FastLinkDirectTool
 
         private void BeginEnable(string message)
         {
-            if (busy || runtime.Enabled) return;
+            if (busy || runtime.Enabled || runtime.CleanupPending || DateTime.Now < nextEnableAllowed) return;
             busy = true;
             SafeLog(message);
             RuleSet rules = CurrentRules();
-            Task.Run(delegate { runtime.Enable(rules, config.DirectPrivateNetworks); }).ContinueWith(delegate(Task task)
+            long rulesRevision = ruleRefreshQueue.RequestedRevision;
+            bool privateNetworks = config.DirectPrivateNetworks;
+            Task.Run(delegate { runtime.Enable(rules, privateNetworks); }).ContinueWith(delegate(Task task)
             {
                 BeginInvoke((Action)delegate
                 {
                     busy = false;
+                    ruleRefreshQueue.Complete(rulesRevision, !task.IsFaulted);
                     if (task.IsFaulted)
                     {
+                        nextEnableAllowed = DateTime.Now.AddMinutes(1);
+                        manualOffUntilReconnect = true;
                         Exception error = task.Exception.GetBaseException();
-                        SafeLog("开启失败：" + error.Message);
-                        trayIcon.ShowBalloonTip(4000, "FastLink 直连助手", "开启失败：" + error.Message, ToolTipIcon.Error);
+                        SafeLog("开启失败，已暂停自动重试；请手动重试或等待 FastLink 下次接通：" + error.Message);
+                        trayIcon.ShowBalloonTip(4000, "FastLink 直连助手", "开启失败，已暂停自动重试：" + error.Message, ToolTipIcon.Error);
                     }
                     else
                     {
@@ -1938,16 +3536,68 @@ namespace FastLinkDirectTool
 
         private void RestartForRuleChange()
         {
-            if (!runtime.Enabled || busy) return;
+            ruleRefreshQueue.Request();
+            HealthEventLogger.Write("rule_change_queued", new Dictionary<string, object>
+            {
+                { "requested_revision", ruleRefreshQueue.RequestedRevision },
+                { "applied_revision", ruleRefreshQueue.AppliedRevision },
+                { "rule_count", ruleList.Items.Count }, { "busy", busy },
+                { "cleanup_pending", runtime.CleanupPending }, { "paused", ruleRefreshQueue.Paused }
+            });
+            if (runtime.CleanupPending)
+            {
+                SafeLog("规则已保存；清理未完成，暂不应用。请先点击“重试安全清理”。");
+                RefreshUi();
+                return;
+            }
+            if (ruleRefreshQueue.Paused)
+                SafeLog("规则已保存；上次刷新失败，已暂停自动重试。请关闭再开启直连。");
+            else if (busy)
+                SafeLog("规则已保存并排队；当前操作完成后会自动应用最新完整列表。");
+            else if (!runtime.Enabled)
+                SafeLog("规则已保存；下次开启直连时应用。");
+            // The existing timer drains pending changes after any busy operation,
+            // including enable/disable and network refresh. Reuse network checks
+            // here so edits cannot bypass the eight-second stability window.
+            if (!busy && runtime.Enabled) CheckFastLink();
+            RefreshUi();
+        }
+
+        private void ApplyPendingRuleChanges()
+        {
+            if (networkRefreshPolicy.Paused ||
+                !ruleRefreshQueue.CanApply(busy, runtime.Enabled, runtime.CleanupPending)) return;
             busy = true;
             RuleSet rules = CurrentRules();
+            long rulesRevision = ruleRefreshQueue.RequestedRevision;
+            bool privateNetworks = config.DirectPrivateNetworks;
+            Stopwatch watch = Stopwatch.StartNew();
             SafeLog("规则已修改，正在刷新…");
-            Task.Run(delegate { runtime.UpdateRules(rules, config.DirectPrivateNetworks); }).ContinueWith(delegate(Task task)
+            HealthEventLogger.Write("rule_refresh_started", new Dictionary<string, object>
+            {
+                { "revision", rulesRevision }, { "rule_count", rules.NormalizedRules.Count },
+                { "namespace_count", rules.GetNrptNamespaces().Count }, { "private_networks", privateNetworks }
+            });
+            Task.Run(delegate { runtime.UpdateRules(rules, privateNetworks); }).ContinueWith(delegate(Task task)
             {
                 BeginInvoke((Action)delegate
                 {
                     busy = false;
-                    SafeLog(task.IsFaulted ? "刷新失败：" + task.Exception.GetBaseException().Message : "规则刷新完成。");
+                    ruleRefreshQueue.Complete(rulesRevision, !task.IsFaulted);
+                    HealthEventLogger.Write(task.IsFaulted ? "rule_refresh_failed" : "rule_refresh_completed",
+                        new Dictionary<string, object>
+                        {
+                            { "revision", rulesRevision }, { "requested_revision", ruleRefreshQueue.RequestedRevision },
+                            { "pending", ruleRefreshQueue.HasPending }, { "paused", ruleRefreshQueue.Paused },
+                            { "rule_count", rules.NormalizedRules.Count }, { "elapsed_ms", watch.ElapsedMilliseconds },
+                            { "error", task.IsFaulted ? task.Exception.GetBaseException().Message : string.Empty }
+                        });
+                    if (task.IsFaulted)
+                        SafeLog("刷新失败，已暂停自动重试；请通过主开关处理：" + task.Exception.GetBaseException().Message);
+                    else
+                        SafeLog(ruleRefreshQueue.HasPending
+                            ? "本批规则已刷新；还有新修改排队，将继续应用最新完整列表。"
+                            : "规则刷新完成，最新完整列表已生效。");
                     RefreshUi();
                 });
             });
@@ -2008,20 +3658,35 @@ namespace FastLinkDirectTool
 
         private void RefreshUi()
         {
-            directStatus.Text = runtime.Enabled ? "直连模式：已开启" : "直连模式：关闭";
-            directStatus.ForeColor = runtime.Enabled ? Color.DarkGreen : Color.DimGray;
+            bool recoverySupported = NetworkDetector.IsLegacyTunnelActive() && FastLinkConnectionCompatibility.CanUseLegacyRecovery();
+            autoRestartFastLink.Enabled = recoverySupported;
+            autoRestartFastLink.Text = recoverySupported ? "网络异常时自动重启 FastLink（默认关闭）" : "当前模式：自动重启暂不启用";
+            directStatus.Text = runtime.CleanupPending ? "模式一：清理未完成，请重试" : (runtime.Enabled ? "模式一（FastLink 分流）：已开启" : "模式一（FastLink 分流）：关闭");
+            directStatus.ForeColor = runtime.CleanupPending ? Color.DarkOrange : (runtime.Enabled ? Color.DarkGreen : Color.DimGray);
+            if (!runtime.CleanupPending && runtime.Enabled && ruleRefreshQueue.HasPending)
+            {
+                directStatus.Text = ruleRefreshQueue.Paused
+                    ? "模式一：规则刷新失败，请关闭再开启"
+                    : (busy ? "模式一：正在刷新规则（新修改会自动排队）" : "模式一：规则等待刷新");
+                directStatus.ForeColor = Color.DarkOrange;
+            }
             if (runtime.Network != null)
             {
+                string networkName = runtime.Network.InterfaceName;
+                if (!string.IsNullOrWhiteSpace(runtime.Network.WifiSsid))
+                    networkName += "（" + runtime.Network.WifiSsid + "）";
                 networkStatus.Text = string.Format("物理网络：{0}    DNS：{1}    网关：{2}",
-                    runtime.Network.InterfaceName, runtime.Network.DnsServer, runtime.Network.Gateway);
+                    networkName, runtime.Network.DnsServer, runtime.Network.Gateway);
             }
             else networkStatus.Text = "物理网络：尚未启用";
 
             mainSwitch.CheckedChanged -= MainSwitchChanged;
             mainSwitch.Checked = runtime.Enabled;
-            mainSwitch.Text = runtime.Enabled ? "关闭直连" : "立即开启直连";
+            mainSwitch.Text = runtime.CleanupPending ? "重试安全清理" : (runtime.Enabled ? "关闭直连" : "立即开启直连");
             mainSwitch.BackColor = runtime.Enabled ? Color.FromArgb(210, 242, 218) : SystemColors.Control;
             mainSwitch.CheckedChanged += MainSwitchChanged;
+            mainSwitch.Enabled = !dualRecoveryPending;
+            if (dualRecoveryPending) directStatus.Text = "双网模式：待恢复，请打开网络模式窗口";
         }
 
         private void SafeLog(string message)
@@ -2052,8 +3717,117 @@ namespace FastLinkDirectTool
 
         private void ExitAndClean()
         {
-            allowExit = true;
-            Close();
+            if (dualRecoveryPending)
+            {
+                SafeLog("双网恢复尚未确认，请先打开网络模式窗口清理；不会提前退出。");
+                return;
+            }
+            if (busy)
+            {
+                SafeLog("当前操作尚未完成，请稍后重试退出。");
+                return;
+            }
+            busy = true;
+            SafeLog("正在安全退出：先清理并核实 DNS 规则，再停止服务。");
+            Task.Run(delegate { runtime.Disable(); }).ContinueWith(delegate(Task task)
+            {
+                BeginInvoke((Action)delegate
+                {
+                    busy = false;
+                    if (task.IsFaulted)
+                    {
+                        string message = "安全清理未完成，助手保持运行，请重试退出：" + task.Exception.GetBaseException().Message;
+                        SafeLog(message);
+                        trayIcon.ShowBalloonTip(5000, "FastLink 直连助手", message, ToolTipIcon.Error);
+                        RefreshUi();
+                        return;
+                    }
+                    allowExit = true;
+                    Close();
+                });
+            });
+        }
+
+        private void OpenDualNetworkMode()
+        {
+            if (busy) { SafeLog("当前操作未完成，请稍后进入网络模式。"); return; }
+            busy = true;
+            bool wasMonitoring = monitorTimer.Enabled;
+            monitorTimer.Stop();
+            if ((runtime.Enabled || runtime.CleanupPending) && MessageBox.Show(this,
+                "进入双网模式前，需要先安全停用旧的 FastLink 直连分流。不会关闭 FastLink 或切换 Wi-Fi，但已有公司连接可能受影响。继续？",
+                "切换模式前确认", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK)
+            {
+                busy = false;
+                if (wasMonitoring) monitorTimer.Start();
+                return;
+            }
+            dualModeSessionSuppressed = true;
+            manualOffUntilReconnect = true;
+            Task.Run(delegate
+            {
+                if (runtime.Enabled || runtime.CleanupPending) runtime.Disable();
+            }).ContinueWith(task => BeginInvoke((Action)delegate
+            {
+                if (task.IsFaulted)
+                {
+                    busy = false;
+                    SafeLog("旧模式清理未完成，不能进入双网模式：" + task.Exception.GetBaseException().Message);
+                    RefreshUi();
+                    return;
+                }
+                bool exitRequested = false;
+                try
+                {
+                    // Modal ownership keeps the legacy monitor/UI from mutating
+                    // routes until the dual session has verified its own cleanup.
+                    bool legacyRequested = false;
+                    bool prepareOnce = prepareNetworkModeOnce;
+                    prepareNetworkModeOnce = false;
+                    using (Modes.DualModeForm form = new Modes.DualModeForm(config.Rules, SafeLog, prepareOnOpen: prepareOnce))
+                    {
+                        bool mainTrayWasVisible = trayIcon.Visible;
+                        bool mainTaskbarWasVisible = ShowInTaskbar;
+                        try
+                        {
+                            // The modal mode window owns the one visible tray
+                            // icon. Its minimize/restore never starts cleanup.
+                            trayIcon.Visible = false;
+                            ShowInTaskbar = false;
+                            form.ShowDialog(this);
+                        }
+                        finally
+                        {
+                            trayIcon.Visible = mainTrayWasVisible;
+                            ShowInTaskbar = mainTaskbarWasVisible;
+                        }
+                        dualRecoveryPending = form.HasOwnedState;
+                        legacyRequested = form.RequestedLegacyMode && !dualRecoveryPending;
+                        exitRequested = form.RequestedApplicationExit && !dualRecoveryPending;
+                    }
+                    // A selection is not permission to start the old controller.
+                    // Keep suppression until the user clicks its main switch.
+                    if (!exitRequested) SafeLog(legacyRequested
+                        ? "已切回模式一界面，原规则保留。连接 FastLink 后，请点击“立即开启直连”；尚未自动启用任何分流。"
+                        : "已返回主界面；原自动分流保持暂停，需点击主开关才重新启用。");
+                }
+                catch (Exception error)
+                {
+                    // A malformed profile alone must not invent a network
+                    // transaction. Read the journal; ambiguous reads still gate
+                    // the original controller conservatively.
+                    try
+                    {
+                        var recovery = new Modes.DualNetworkRuntime(new Modes.DualNetworkWindowsPlatform(),
+                            new Modes.DualFileJournal(), new Modes.DualNetworkDns());
+                        dualRecoveryPending = recovery.HasPending;
+                    }
+                    catch { dualRecoveryPending = true; }
+                    SafeLog("双网界面未能正常打开；旧模式仍暂停" + (dualRecoveryPending ? "，保留待恢复状态" : "，没有发现网络事务记录") + "：" + error.Message);
+                }
+                finally { busy = false; RefreshUi(); if (!exitRequested) monitorTimer.Start(); }
+                if (exitRequested) ExitAndClean();
+            }));
         }
     }
 }

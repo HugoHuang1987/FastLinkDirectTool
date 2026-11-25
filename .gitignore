@@ -8,3 +8,20 @@ runtime.log*
 *.pdb
 obj/
 bin/
+# Local routing rules, machine identity, recovery journals and diagnostics are private.
+config.json
+dual-profile.json
+dual-session.json*
+routes.json
+*bypass*state*.json
+health-events.jsonl*
+diagnostics/*.csv
+diagnostics/*.json
+diagnostics/*.jsonl*
+diagnostics/*.log*
+diagnostics/latest-*.txt
+diagnostics/anydesk/
+backups/
+codex_tasks/
+.env
+.env.*
