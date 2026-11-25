@@ -13,6 +13,8 @@ namespace FastLinkDirectTool.Tests
 {
     internal static class DualModeUiTests
     {
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern IntPtr SendMessage(IntPtr window, int message, IntPtr wParam, IntPtr lParam);
         private sealed class FakeSession : IDualModeUiSession
         {
             internal bool Active, Armed, Pending, FailStop, NullArm;
@@ -401,7 +403,7 @@ namespace FastLinkDirectTool.Tests
                     if(!TrayState(form)||form.ShowInTaskbar||form.IsDisposed||form.RequestedApplicationExit||form.RequestedLegacyMode)
                         throw new Exception("Minimize escaped tray state or requested close");
                     Invoke(form,"MinimizeToTray");Invoke(form,"RestoreFromTray");Application.DoEvents();
-                    if(TrayState(form)||!form.ShowInTaskbar||form.WindowState!=FormWindowState.Normal)
+                    if(TrayState(form)||form.ShowInTaskbar||form.WindowState!=FormWindowState.Normal)
                         throw new Exception("Tray restore did not restore ordinary window state");
                     if(fake.Arms!=0||fake.Starts!=0||fake.Stops!=0||fake.Validations!=0||!form.HasOwnedState)
                         throw new Exception("Repeated tray operations changed the active session");
@@ -424,7 +426,7 @@ namespace FastLinkDirectTool.Tests
                 if(form.IsDisposed||form.RequestedApplicationExit||!form.HasOwnedState)
                     throw new Exception("Tray state bypassed failed red-button cleanup");
                 Invoke(form,"RestoreFromTray");
-                if(TrayState(form)||!form.ShowInTaskbar||!Button(form,"退出助手").Enabled)
+                if(TrayState(form)||form.ShowInTaskbar||!Button(form,"退出助手").Enabled)
                     throw new Exception("Failed cleanup left the window inaccessible");
                 fake.FailStop=false;Click(form,"退出助手");Pump(()=>form.IsDisposed);
                 if(fake.Stops!=2||!form.RequestedApplicationExit)throw new Exception("Explicit retry did not safely exit");
@@ -503,7 +505,87 @@ namespace FastLinkDirectTool.Tests
                     throw new Exception("Transparent modal minimize did not retain its loop until explicit safe exit");
             }
             passed++;Console.WriteLine("PASS transparent modal stays visible and running while minimized without repeated Shown or network work");
+            Exception nativeFailure=null;
+            foreach(bool active in new[]{false,true})
+            {
+                try{NativeOwnedModalMinimizeCase(source,active);passed++;}
+                catch(Exception error){if(nativeFailure==null)nativeFailure=error;}
+            }
+            if(nativeFailure!=null)throw nativeFailure;
             return passed;
+        }
+        private static void NativeOwnedModalMinimizeCase(List<string> source,bool active)
+        {
+            var fake=new FakeSession{Armed=active,Active=active};
+            var trace=new List<string>();var watch=Stopwatch.StartNew();
+            using(var owner=new Form())
+            using(var form=new DualModeForm(source,delegate{},true,fake))
+            using(var ticks=new System.Windows.Forms.Timer())
+            {
+                owner.Text="Offline tray owner fixture";owner.Opacity=0;
+                owner.StartPosition=FormStartPosition.Manual;owner.Location=new Point(-30000,-30000);
+                owner.ShowInTaskbar=true;
+                if(form.ShowInTaskbar||form.IsHandleCreated)throw new Exception("Modal taskbar style was not fixed before handle creation");
+                form.Opacity=0;form.StartPosition=FormStartPosition.Manual;
+                form.Location=new Point(-30000,-30000);
+                int stage=0,shown=0,rounds=0,created=0,destroyed=0;IntPtr originalHandle=IntPtr.Zero;
+                bool observed=false,explicitExit=false;Exception failure=null;
+                Action<string> record=delegate(string e){trace.Add(watch.ElapsedMilliseconds+":"+e+" visible="+form.Visible+" state="+form.WindowState+" taskbar="+form.ShowInTaskbar+" result="+form.DialogResult+" exit="+form.RequestedApplicationExit+" stops="+fake.Stops);};
+                owner.HandleCreated+=delegate{record("owner.HandleCreated");};
+                owner.HandleDestroyed+=delegate{record("owner.HandleDestroyed");};
+                owner.FormClosing+=delegate(object s,FormClosingEventArgs e){record("owner.FormClosing:"+e.CloseReason);};
+                form.HandleCreated+=delegate{created++;record("child.HandleCreated");};
+                form.HandleDestroyed+=delegate{destroyed++;record("child.HandleDestroyed");};
+                form.Shown+=delegate{shown++;record("child.Shown");};
+                form.FormClosing+=delegate(object s,FormClosingEventArgs e){record("child.FormClosing:"+e.CloseReason+":cancel="+e.Cancel);};
+                form.FormClosed+=delegate{record("child.FormClosed");};
+                ticks.Interval=80;
+                ticks.Tick+=delegate
+                {
+                    try
+                    {
+                        if(watch.ElapsedMilliseconds>5000)throw new Exception("Native minimize fixture timed out");
+                        if(!form.Visible||form.ShowInTaskbar||shown!=1||created!=1||destroyed!=0||form.DialogResult!=DialogResult.None||form.RequestedApplicationExit||fake.Stops!=0)
+                            throw new Exception("Native tray cycle rebuilt, closed or cleaned the real owned modal");
+                        if(originalHandle==IntPtr.Zero)originalHandle=form.Handle;
+                        if(form.Handle!=originalHandle)throw new Exception("Native tray cycle changed the modal handle");
+                        if(stage==0)
+                        {
+                            stage=1;
+                            record("send.SC_MINIMIZE");
+                            SendMessage(form.Handle,0x0112,new IntPtr(0xF020),IntPtr.Zero);
+                            record("return.SC_MINIMIZE");
+                            return;
+                        }
+                        if(stage==1)
+                        {
+                            if(!TrayState(form)||form.WindowState!=FormWindowState.Minimized)
+                                throw new Exception("Native minimize ended or cleaned the real owned modal");
+                            stage=2;Invoke(form,"RestoreFromTray");record("restore");return;
+                        }
+                        if(TrayState(form)||form.WindowState!=FormWindowState.Normal)
+                            throw new Exception("Native minimized modal did not survive handle recreation and restore");
+                        rounds++;
+                        if(rounds<3){stage=0;return;}
+                        if(fake.Arms!=0||fake.Starts!=0||fake.Validations!=0||form.HasOwnedState!=active)
+                            throw new Exception("Native tray cycles modified the runtime session");
+                        AssertPreviewHasNoTrayIcon(form);observed=true;explicitExit=true;ticks.Stop();
+                        record("explicit.exit");Click(form,"退出助手");
+                    }
+                    catch(Exception error){failure=error;ticks.Stop();form.Dispose();}
+                };
+                owner.Show();Application.DoEvents();owner.ShowInTaskbar=false;
+                ticks.Start();DialogResult result=form.ShowDialog(owner);ticks.Stop();record("ShowDialog.return:"+result);
+                if(!observed||!explicitExit||failure!=null)
+                {
+                    Console.WriteLine("NATIVE_MODAL_TRACE active="+active+" "+string.Join(" || ",trace.ToArray()));
+                    throw failure??new Exception("Native minimize unexpectedly returned before explicit exit; active="+active);
+                }
+                if(fake.Stops!=(active?1:0)||!form.RequestedApplicationExit)
+                    throw new Exception("Native modal final explicit cleanup mismatch");
+                Console.WriteLine("NATIVE_MODAL_TRACE active="+active+" "+string.Join(" || ",trace.ToArray()));
+            }
+            Console.WriteLine("PASS three native SC_MINIMIZE and restore cycles retain owned modal handle active="+active);
         }
         private static IEnumerable<Control> Controls(Control parent)
         { foreach(Control child in parent.Controls) { yield return child; foreach(Control desc in Controls(child)) yield return desc; } }

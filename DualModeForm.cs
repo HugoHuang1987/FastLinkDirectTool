@@ -55,6 +55,11 @@ namespace FastLinkDirectTool.Modes
 
         internal DualModeForm(IEnumerable<string> sourceRules, Action<string> logger, bool previewOnly = false, IDualModeUiSession previewSession = null, Func<bool> previewStopApproval = null, bool prepareOnOpen = false)
         {
+            // Keep this modal window's taskbar style fixed before creating its
+            // handle. Changing ShowInTaskbar while ShowDialog is running can
+            // recreate the handle and turn DialogResult into Cancel, which
+            // would incorrectly turn minimizing into an application exit.
+            ShowInTaskbar = false;
             if (previewSession != null && !previewOnly) throw new ArgumentException("Session injection is only supported by offline UI tests.");
             if (previewStopApproval != null && !previewOnly) throw new ArgumentException("Approval injection is only supported by offline UI tests.");
             offlinePreview = previewOnly;
@@ -206,9 +211,8 @@ namespace FastLinkDirectTool.Modes
             trayTransitioning = true;
             try
             {
-                // Never Hide or Close a modal form: that can end ShowDialog and
-                // abandon the live DNS/runtime owner. Keep Visible untouched.
-                ShowInTaskbar = false;
+                // Never Hide, Close or recreate this modal form's handle:
+                // ShowDialog must retain the live DNS/runtime owner.
                 WindowState = FormWindowState.Minimized;
                 minimizedToTray = true;
             }
@@ -221,7 +225,6 @@ namespace FastLinkDirectTool.Modes
             trayTransitioning = true;
             try
             {
-                ShowInTaskbar = true;
                 WindowState = FormWindowState.Normal;
                 minimizedToTray = false;
                 if (!offlinePreview) Activate();
