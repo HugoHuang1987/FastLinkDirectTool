@@ -75,6 +75,38 @@ namespace FastLinkDirectTool.Modes
         public bool Pending { get; set; }
         public string State { get; set; }
         public string Message { get; set; }
+        // A detached, read-verified preparation snapshot for display only. It
+        // never authorizes Start or supplies a saved admission/Internet proof.
+        public NetworkSnapshot VerifiedPreparationSnapshot { get; set; }
+    }
+
+    // Only a backend that positively confirmed its timed-out read worker has
+    // exited may create this exception. Unknown failures and all writes remain
+    // fatal; the runtime never classifies transience by matching an error text.
+    public sealed class DualReadUnavailableException : InvalidOperationException
+    {
+        public string Code { get; private set; }
+        public DualReadUnavailableException(string code)
+            : base("只读网络命令超时，执行进程已确认回收。")
+        {
+            if (code != "worker_timeout:startup" && code != "worker_timeout:send" && code != "worker_timeout:response")
+                throw new ArgumentException("Unconfirmed read timeout code.");
+            Code = code;
+        }
+    }
+
+    public sealed class DualRuntimeFailure
+    {
+        public DateTime Utc { get; private set; }
+        public long Generation { get; private set; }
+        public string Stage { get; private set; }
+        public string Code { get; private set; }
+        public string Message { get; private set; }
+        public bool Deferred { get; private set; }
+        internal DualRuntimeFailure(DateTime utc, long generation, string stage, string code, string message, bool deferred)
+        { Utc = utc; Generation = generation; Stage = stage; Code = code; Message = message; Deferred = deferred; }
+        internal DualRuntimeFailure Copy()
+        { return new DualRuntimeFailure(Utc, Generation, Stage, Code, Message, Deferred); }
     }
 
     // All effects are injected. Constructing this class performs no IO. A UI
@@ -93,8 +125,15 @@ namespace FastLinkDirectTool.Modes
         private long generation;
         private volatile bool active;
         private volatile bool armed;
+        private bool preparedCorporateKnown;
         private volatile bool pending;
         private volatile string state = "Idle";
+        private volatile DualRuntimeFailure lastFailure;
+        private long mutationVersion;
+        private int readFailureCount;
+        private DateTime readFailureSince, readRetryAfter;
+        private readonly HashSet<string> unverifiedReadOperations = new HashSet<string>(StringComparer.Ordinal);
+        private const int MaximumReadFailures = 3, MaximumUnverifiedSeconds = 30, ReadRetrySeconds = 5;
         private readonly Dictionary<uint, RuleTarget> confirmedAddressTargets = new Dictionary<uint, RuleTarget>();
         private readonly Dictionary<uint, DateTime> addressVerifiedAt = new Dictionary<uint, DateTime>();
         private readonly Dictionary<uint, DualResource> addressRoutes = new Dictionary<uint, DualResource>();
@@ -129,6 +168,7 @@ namespace FastLinkDirectTool.Modes
         }
         public long Generation { get { return Interlocked.Read(ref generation); } }
         public string State { get { return state; } }
+        public DualRuntimeFailure LastFailure { get { DualRuntimeFailure value = lastFailure; return value == null ? null : value.Copy(); } }
 
         public DualNetworkRuntime(IDualNetworkPlatform platform, IDualJournal journal, IDualDnsService dns)
             : this(platform, journal, dns, delegate { return DateTime.UtcNow; }) { }
@@ -208,6 +248,7 @@ namespace FastLinkDirectTool.Modes
                             "server=127.0.0.1;owner=" + document.Owner, false);
                     VerifySnapshotUnchanged(snapshot, platform.Capture());
                     SavePhase("Running");
+                    ResetReadFailures(); lastFailure = null;
                     armed = true; state = "Running";
                     return Result(true, "双网分流事务已完成并读回核验。");
                 }
@@ -453,6 +494,7 @@ namespace FastLinkDirectTool.Modes
             if (document == null)
             {
                 if (journal.Load() != null) { pending = true; state = "RecoveryRequired"; throw new InvalidOperationException("发现上次会话日志，禁止覆盖，须先恢复。"); }
+                ResetReadFailures(); lastFailure = null;
                 request = CloneRequest(requested);
                 document = new DualJournalDocument
                 {
@@ -471,6 +513,7 @@ namespace FastLinkDirectTool.Modes
                 EnsureDnsRoutes(snapshot);
                 EnsureStaticRoutes(snapshot);
             }
+            preparedCorporateKnown = corporate != null;
             armed = true;
             state = CorporatePresent(request, snapshot) ? "Armed" : "WaitingForCorporate";
             SavePhase(state);
@@ -483,6 +526,12 @@ namespace FastLinkDirectTool.Modes
                 if (!active || pending || document == null || expectedGeneration != generation ||
                     (target != RuleTarget.Corporate && target != RuleTarget.Internet)) return false;
                 if (addresses == null || addresses.Length == 0) return target == RuleTarget.Internet;
+                int entriesBefore = document.Entries.Count;
+                long mutationBefore = mutationVersion;
+                string stage = "dns_answer_validation";
+                string readOperation = "dns|" + ((int)target).ToString(CultureInfo.InvariantCulture) + "|" +
+                    string.Join(",", addresses.Distinct(StringComparer.Ordinal).OrderBy(a => a, StringComparer.Ordinal).ToArray());
+                bool performedRead = false;
                 try
                 {
                     AdapterSnapshot corporate = Find(activeSnapshot, request.CorporateAdapterId), internet = Find(activeSnapshot, request.InternetAdapterId);
@@ -512,11 +561,20 @@ namespace FastLinkDirectTool.Modes
                     }
                     // Ownership/target evidence never expires, only the readback
                     // cache does. A deleted borrowed route must not be recreated.
+                    bool needsRead = expiredAddresses.Count > 0 || safeAddresses.Count > 0 || covered.Values.Any(delegate(DualResource route)
+                    {
+                        DateTime verified;
+                        return !routeVerifiedAt.TryGetValue(ResourceKey(route), out verified) || now < verified || (now - verified).TotalSeconds >= 60;
+                    });
+                    if (ReadDeferralExpired(now))
+                    { stage = "dns_read_deferral_expired"; throw new DualReadUnavailableException("worker_timeout:response"); }
+                    if (needsRead && readFailureCount > 0 && now < readRetryAfter) return false;
                     foreach (string address in expiredAddresses)
                     {
                         uint value; string canonical; PlanningValidation.TryIpv4(address, out value, out canonical);
                         DualResource route;
                         if (!addressRoutes.TryGetValue(value, out route)) throw new InvalidOperationException("已确认地址缺少路由关联。");
+                        stage = "dns_cached_route_read"; performedRead = true;
                         VerifyConfirmedRoute(route); addressVerifiedAt[value] = now;
                     }
                     if (confirmedAddressTargets.Count + covered.Count + safeAddresses.Count > MaximumResources)
@@ -525,19 +583,28 @@ namespace FastLinkDirectTool.Modes
                     {
                         DateTime verified;
                         if (!routeVerifiedAt.TryGetValue(ResourceKey(item.Value), out verified) || now < verified || (now - verified).TotalSeconds >= 60)
-                            VerifyConfirmedRoute(item.Value);
+                        { stage = "dns_covering_route_read"; performedRead = true; VerifyConfirmedRoute(item.Value); }
                         confirmedAddressTargets[item.Key] = target; addressVerifiedAt[item.Key] = now; addressRoutes[item.Key] = item.Value;
                     }
-                    if (safeAddresses.Count == 0) return true; // Within 60 seconds: ZERO platform calls.
+                    if (safeAddresses.Count == 0)
+                    { if (performedRead) CompleteReadOperation(readOperation); return true; } // Fresh cache: ZERO platform calls.
                     if (document.Entries.Count + borrowedResources.Count + safeAddresses.Count > MaximumResources)
                         throw new InvalidOperationException("已达到 4096 个会话资源上限，停止并清理；路由保留至停用，不无限累积。");
+                    stage = "dns_capture";
                     NetworkSnapshot snapshot = platform.Capture(); // New destinations: one topology capture.
+                    stage = "dns_topology";
                     VerifySnapshotUnchanged(activeSnapshot, snapshot);
                     AdapterSnapshot adapter = Find(snapshot, target == RuleTarget.Corporate ? request.CorporateAdapterId : request.InternetAdapterId);
+                    stage = "dns_route_write";
                     foreach (string address in safeAddresses) WriteOwned(Route(adapter, address + "/32"), "metric=1", true);
+                    CompleteReadOperation(readOperation);
                     return true;
                 }
-                catch (Exception error) { FailAndRollback(error); return false; }
+                catch (Exception error)
+                {
+                    if (!DeferReadFailure(error, stage, entriesBefore, mutationBefore, readOperation)) FailAndRollback(error, stage);
+                    return false;
+                }
             }
         }
 
@@ -614,6 +681,7 @@ namespace FastLinkDirectTool.Modes
             document.Entries.Add(write);
             journal.Save(document); // Persist before ANY network mutation.
             if (!ResourceValuesEqual(resource, platform.Read(resource), before)) throw new InvalidOperationException("资源在写入前发生外部变化。");
+            ++mutationVersion;
             platform.Write(resource, after);
             // Applied means the platform positively confirmed THIS write, not
             // merely that the same value appeared. A concurrent external route
@@ -720,8 +788,9 @@ namespace FastLinkDirectTool.Modes
             }
         }
 
-        private DualOperationResult FailAndRollback(Exception error)
+        private DualOperationResult FailAndRollback(Exception error, string stage = "operation")
         {
+            RememberFailure(error, stage, false);
             if (document == null) return Result(false, error.Message);
             try
             {
@@ -759,17 +828,152 @@ namespace FastLinkDirectTool.Modes
             try { dns.Pause(); } catch { }
         }
 
+        private bool ReadDeferralExpired(DateTime now)
+        { return readFailureCount > 0 && (now < readFailureSince || (now - readFailureSince).TotalSeconds >= MaximumUnverifiedSeconds); }
+
+        private bool DeferReadFailure(Exception error, string stage, int entriesBefore, long mutationBefore, string operation, bool allowPrepared = false)
+        {
+            if (!(error is DualReadUnavailableException) || (!active && !(allowPrepared && armed)) || pending || document == null ||
+                document.Entries.Count != entriesBefore || mutationVersion != mutationBefore) return false;
+            DateTime now = utcNow();
+            if (readFailureCount == 0) readFailureSince = now;
+            unverifiedReadOperations.Add(operation);
+            ++readFailureCount;
+            if (readFailureCount >= MaximumReadFailures || ReadDeferralExpired(now)) return false;
+            readRetryAfter = now.AddSeconds(ReadRetrySeconds);
+            RememberFailure(error, stage, true);
+            return true;
+        }
+
+        private void ResetReadFailures()
+        {
+            readFailureCount = 0; readFailureSince = readRetryAfter = default(DateTime);
+            unverifiedReadOperations.Clear();
+            if (lastFailure != null && lastFailure.Deferred) lastFailure = null;
+        }
+
+        private void CompleteReadOperation(string operation)
+        {
+            // A healthy unrelated DNS cache/request must not renew the budget
+            // for another destination or a still-unverified topology check.
+            if (unverifiedReadOperations.Remove(operation) && unverifiedReadOperations.Count == 0)
+                ResetReadFailures();
+        }
+
+        private static string SafeFailureCode(Exception error)
+        {
+            DualReadUnavailableException unavailable = error as DualReadUnavailableException;
+            if (unavailable != null) return unavailable.Code;
+            string message = error.Message ?? string.Empty;
+            int first = message.IndexOf("[worker_", StringComparison.Ordinal), last = first < 0 ? -1 : message.IndexOf(']', first);
+            if (last > first && last - first < 110)
+            {
+                string code = message.Substring(first + 1, last - first - 1);
+                if (code.All(c => char.IsLetterOrDigit(c) || c == '_' || c == ':' || c == '.')) return code;
+            }
+            if (message.Contains("已确认的路由已被删除或修改")) return "route_readback_changed";
+            if (message.Contains("外部修改") || message.Contains("外部变化")) return "resource_ownership_changed";
+            if (message.Contains("读回")) return "resource_readback_mismatch";
+            if (message.Contains("接口地址、DNS 或网关")) return "topology_changed";
+            return error.GetType().Name;
+        }
+
+        private void RememberFailure(Exception error, string stage, bool deferred)
+        {
+            string code = SafeFailureCode(error);
+            string message = code == "route_readback_changed" ? "已确认的路由已被删除或修改，未重建或覆盖。" :
+                code == "resource_ownership_changed" ? "已管理资源发生外部变化，未覆盖。" :
+                code == "resource_readback_mismatch" ? "资源读回与预期不一致。" :
+                code == "topology_changed" ? "接口地址、DNS 或网关在会话期间变化。" :
+                error is DualReadUnavailableException ? "只读网络命令超时，执行进程已确认回收。" : "网络操作未通过核验。";
+            if (deferred) message += " 本次请求未通过核验，暂时保留已有会话；5 秒后允许重试，最多暂缓两次/30 秒。";
+            lastFailure = new DualRuntimeFailure(utcNow(), generation, stage, code, message, deferred);
+        }
+
+        private DualOperationResult PendingFailureResult()
+        {
+            DualRuntimeFailure failure = lastFailure;
+            string message = failure == null ? "当前会话已暂停并保留待处理记录。" :
+                failure.Message + " [" + failure.Stage + "/" + failure.Code + "]";
+            message += state == "PreparedInvalidated" ? " 准备状态已撤销；原恢复记录、路由及当前接口优先级均保留，未自动清理或覆盖，请手动核查。" :
+                state == "InternetProtected" ? " DNS/业务路由已清理，仅保留外网优先设置，等待手动处理。" : " 依赖清理尚未全部核验，未自动重试。";
+            return Result(false, message);
+        }
+
+        private DualOperationResult DeferredReadResult()
+        {
+            DualRuntimeFailure failure = lastFailure;
+            return new DualOperationResult { Success = false, Pending = false, State = "ReadDeferred",
+                Message = failure == null ? "只读核验暂缓，尚未重新确认网络状态。" : failure.Message + " [" + failure.Stage + "/" + failure.Code + "]" };
+        }
+
+        private DualOperationResult InvalidatePreparedState(Exception error, string stage)
+        {
+            // Preparation may already own metrics and authentication routes.
+            // A passive check has no authority to restore or overwrite them.
+            RememberFailure(error, stage, false);
+            armed = false; pending = true; state = "PreparedInvalidated"; ++generation;
+            return PendingFailureResult();
+        }
+
+        private void VerifyPreparedState(NetworkSnapshot snapshot)
+        {
+            if (snapshot == null || snapshot.Adapters == null || document == null || document.Scope != Scope(request))
+                throw new InvalidOperationException("准备态接口身份或恢复记录范围发生外部变化。");
+            if (snapshot.Adapters.Count(a => a != null && string.Equals(a.Id, request.InternetAdapterId, StringComparison.OrdinalIgnoreCase)) != 1 ||
+                snapshot.Adapters.Count(a => a != null && string.Equals(a.Id, request.CorporateAdapterId, StringComparison.OrdinalIgnoreCase)) > 1)
+                throw new InvalidOperationException("准备态接口 ID 缺失或重复，发生外部变化。");
+            AdapterSnapshot internet = Find(snapshot, request.InternetAdapterId), corporate = Find(snapshot, request.CorporateAdapterId);
+            LinkKind expectedInternet = request.Mode == WorkMode.WiredCorporateWifiInternet ? LinkKind.Wifi : LinkKind.Ethernet;
+            if (!internet.IsPhysical || !internet.IsUp || internet.Kind != expectedInternet ||
+                (corporate != null && (!corporate.IsPhysical || corporate.Kind == expectedInternet || corporate.Kind == LinkKind.Other)))
+                throw new InvalidOperationException("准备态物理接口身份或连接发生外部变化。");
+            if (snapshot.SystemProxyActive || snapshot.TunnelActive || snapshot.OtherDnsPolicyPresent ||
+                NetworkModePlanner.Ipv6CompatibilityBlocker(request, snapshot) != null)
+                throw new InvalidOperationException("准备态代理、隧道或 DNS 条件发生外部变化。");
+            foreach (DualJournalEntry entry in document.Entries.Where(e => !e.Restored && e.Resource.Kind == DualResourceKind.Metric4))
+                if (!entry.Applied || entry.Resource.Owner != document.Owner || Find(snapshot, entry.Resource.InterfaceId) == null)
+                    throw new InvalidOperationException("准备态已管理接口身份或跃点归属发生外部变化。");
+            // An unplugged corporate adapter remains valid if its GUID and
+            // metric still match. Do not demand fresh admission/reachability
+            // here: connecting that adapter is part of the prepared workflow.
+            if (corporate == null && preparedCorporateKnown)
+                throw new InvalidOperationException("准备态公司接口 ID 缺失，发生外部变化。");
+            foreach (string id in corporate == null ? new[] { request.InternetAdapterId } : new[] { request.InternetAdapterId, request.CorporateAdapterId })
+            {
+                string expected = string.Equals(id, request.InternetAdapterId, StringComparison.OrdinalIgnoreCase) ? "automatic=0;metric=5" : "automatic=0;metric=55";
+                DualJournalEntry owned = document.Entries.FirstOrDefault(e => !e.Restored && e.Resource.Kind == DualResourceKind.Metric4 &&
+                    string.Equals(e.Resource.InterfaceId, id, StringComparison.OrdinalIgnoreCase));
+                if ((owned != null && owned.After != expected) || platform.Read(Metric(id)) != expected)
+                    throw new InvalidOperationException("准备态接口跃点发生外部变化，未覆盖或自动恢复。");
+            }
+        }
+
         // Call from a low-frequency UI worker, not per DNS request. A mismatch
         // stops this transaction; it never switches Wi-Fi or restarts a VPN.
         public DualOperationResult ValidateCurrent()
         {
+            // The already-pending path is diagnostic only, even while another
+            // worker is still unwinding. It must never Capture or clean again.
+            if (pending) return PendingFailureResult();
             long expectedGeneration;
             ModeRequest expectedRequest;
             NetworkSnapshot expectedSnapshot;
+            int entriesBefore;
+            long mutationBefore;
+            bool preparedOnly;
             lock (sync)
             {
-                if (!active) return Result(!pending, "当前没有运行中的双网会话。");
+                if (pending) return PendingFailureResult();
+                if (!active && !armed) return Result(true, "当前没有运行中的双网会话。");
+                preparedOnly = !active;
+                DateTime now = utcNow();
+                if (ReadDeferralExpired(now))
+                    return preparedOnly ? InvalidatePreparedState(new DualReadUnavailableException("worker_timeout:response"), "prepared_read_deferral_expired") :
+                        FailAndRollback(new DualReadUnavailableException("worker_timeout:response"), "validate_read_deferral_expired");
+                if (readFailureCount > 0 && now < readRetryAfter) return DeferredReadResult();
                 expectedGeneration = generation; expectedRequest = request; expectedSnapshot = activeSnapshot;
+                entriesBefore = document.Entries.Count; mutationBefore = mutationVersion;
             }
             // Capture may take seconds. It must not hold the route-write lock:
             // already verified DNS answers require no platform calls and should
@@ -782,28 +986,52 @@ namespace FastLinkDirectTool.Modes
             {
                 // Stop or Start may have completed during Capture. A late result
                 // (including a failure) belongs only to its original generation.
-                if (!active || generation != expectedGeneration || !object.ReferenceEquals(request, expectedRequest) ||
-                    !object.ReferenceEquals(activeSnapshot, expectedSnapshot))
-                    return Result(!pending, "会话已变化，忽略上一代网络检查结果。");
+                if ((preparedOnly ? active || !armed : !active) || generation != expectedGeneration || !object.ReferenceEquals(request, expectedRequest) ||
+                    !object.ReferenceEquals(activeSnapshot, expectedSnapshot) ||
+                    (preparedOnly && (document == null || document.Entries.Count != entriesBefore || mutationVersion != mutationBefore)))
+                    return pending ? PendingFailureResult() : Result(true, "会话已变化，忽略上一代网络检查结果。");
+                string stage = "validate_capture";
+                // Capture is pure read-only. Concurrent legitimate DNS writes
+                // completed before this lock belong to their own operations.
+                entriesBefore = document.Entries.Count; mutationBefore = mutationVersion;
                 try
                 {
                     if (captureError != null) throw captureError;
+                    if (preparedOnly)
+                    {
+                        stage = "prepared_identity_metric_read";
+                        VerifyPreparedState(captured);
+                        CompleteReadOperation("prepared_validation");
+                        if (readFailureCount > 0) return DeferredReadResult();
+                        DualOperationResult verified = Result(true, "准备态接口 GUID 与外网/公司跃点已只读核验；尚未启用域名分流。");
+                        verified.VerifiedPreparationSnapshot = CloneSnapshot(captured);
+                        return verified;
+                    }
+                    stage = "validate_topology";
                     VerifySnapshotUnchanged(expectedSnapshot, captured);
                     // One route per six UI checks, not a claim of a full live
                     // route-table audit. DNS answers additionally expire at 60s.
                     if (++validationCalls >= 6)
                     {
-                        validationCalls = 0;
                         if (confirmedRoutes.Count > 0)
                         {
                             int index = routeAuditIndex % confirmedRoutes.Count;
+                            stage = "validate_route_read";
                             VerifyConfirmedRoute(confirmedRoutes.Values.ElementAt(index));
                             routeAuditIndex = index + 1;
                         }
+                        validationCalls = 0;
                     }
+                    CompleteReadOperation("validation");
+                    if (readFailureCount > 0) return DeferredReadResult();
                     return Result(true, "网络身份未变；路由使用有限缓存并低频轮转核验。");
                 }
-                catch (Exception error) { return FailAndRollback(error); }
+                catch (Exception error)
+                {
+                    if (DeferReadFailure(error, stage, entriesBefore, mutationBefore, preparedOnly ? "prepared_validation" : "validation", preparedOnly)) return DeferredReadResult();
+                    if (preparedOnly) return InvalidatePreparedState(error, stage);
+                    return FailAndRollback(error, stage);
+                }
             }
         }
 

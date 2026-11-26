@@ -33,7 +33,7 @@ namespace FastLinkDirectTool.Tests
             public DualReconciliationReport ReviewStaleSession(){Reviews++;return new DualReconciliationReport{CanArchive=ReviewAllowed,HasJournal=true,Message="fake read-only review"};}
             public DualOperationResult ArchiveStaleSession(bool allowed){if(!allowed)throw new Exception("missing archive approval");Archives++;if(!ArchiveFails)Pending=false;return Result(!ArchiveFails);}
             public DualOperationResult Arm(ModeRequest request,bool allowed){if(!allowed)throw new Exception("missing permission");LastRequest=request;Arms++;if(BeforeArm!=null)BeforeArm();if(NullArm)return null;Armed=true;return Result(true);}
-            public DualOperationResult Start(ModeRequest request,bool allowed){if(!allowed)throw new Exception("missing permission");Starts++;Armed=Active=true;return Result(true);}
+            public DualOperationResult Start(ModeRequest request,bool allowed){if(!allowed)throw new Exception("missing permission");LastRequest=request;Starts++;Armed=Active=true;return Result(true);}
             public DualOperationResult Stop(bool allowEgressChange){Interlocked.Increment(ref Stops);LastStopApproval=allowEgressChange;if(StopBehavior!=null)return StopBehavior();if(FailStop){Pending=true;return Result(false);}Active=Armed=Pending=false;return Result(true);}
         }
         private static void Pump(Func<bool> done)
@@ -55,7 +55,14 @@ namespace FastLinkDirectTool.Tests
                 foreach(DataGridViewRow row in Controls(form).OfType<DataGridView>().Single().Rows)
                     if(!row.IsNewRow&&Convert.ToString(row.Cells[1].Value)=="待确认")row.Cells[1].Value="公司内网";
         }
-        private static Button Button(Form form,string text){return Controls(form).OfType<Button>().Single(b=>b.Text==text);}
+        // Retain semantic aliases so the pre-existing cleanup cases exercise
+        // the same actions after the daily UI labels have been simplified.
+        private static Button Button(Form form,string text)
+        {
+            if(text=="启用双网分流")text="开始分流";
+            if(text=="停用 / 恢复清理")text="停止分流";
+            return Controls(form).OfType<Button>().Single(b=>b.Text==text);
+        }
         private static void Click(Button button){if(button.Enabled)typeof(Button).GetMethod("OnClick",BindingFlags.Instance|BindingFlags.NonPublic).Invoke(button,new object[]{EventArgs.Empty});}
         private static void Click(Form form,string text){Click(Button(form,text));}
         private static void SessionCases(List<string> source)
@@ -90,8 +97,10 @@ namespace FastLinkDirectTool.Tests
             fake=new FakeSession{Armed=true};
             using(var form=new DualModeForm(source,delegate{},true,fake))
             {
-                HiddenShow(form);form.Close();Pump(()=>form.IsDisposed);
-                if(!form.RequestedApplicationExit||fake.Stops!=1)throw new Exception("Window X bypassed unified cleanup");
+                HiddenShow(form);form.Close();Application.DoEvents();
+                if(form.IsDisposed||form.RequestedApplicationExit||fake.Stops!=0||!TrayState(form))throw new Exception("Window X cleaned instead of collecting to tray");
+                Invoke(form,"RestoreFromTray");Click(form,"退出助手");Pump(()=>form.IsDisposed);
+                if(!form.RequestedApplicationExit||fake.Stops!=1)throw new Exception("Explicit exit did not retain unified cleanup");
             }
         }
         private static int ExitCases(List<string> source)
@@ -117,8 +126,9 @@ namespace FastLinkDirectTool.Tests
             using(var form=new DualModeForm(source,delegate{},true,fake))
             {
                 HiddenShow(form);
-                for(int i=0;i<5;i++)typeof(DualModeForm).GetMethod("RefreshReadOnly",BindingFlags.NonPublic|BindingFlags.Instance).Invoke(form,null);
-                if(fake.Stops!=0||!Button(form,"检查状态").Enabled||!Controls(form).OfType<TextBox>().Any(b=>b.Text.Contains("自动检查与自动清理已暂停")))throw new Exception("Pending state repeatedly cleaned or disabled UI");
+                for(int i=0;i<5;i++)
+                { typeof(DualModeForm).GetMethod("RefreshReadOnly",BindingFlags.NonPublic|BindingFlags.Instance).Invoke(form,null);Pump(()=>!Field<bool>(form,"working")); }
+                if(fake.Stops!=0||fake.Validations!=5||!Button(form,"检查状态").Enabled||!Controls(form).OfType<TextBox>().Any(b=>b.Text.Contains("分流已暂停")&&b.Text.Contains("fake retained cleanup")))throw new Exception("Pending state repeatedly cleaned, hid its stored reason, or disabled UI");
             }
             passed++;Console.WriteLine("PASS pending state never schedules automatic cleanup");
             fake=new FakeSession{Armed=true,Active=true};
@@ -167,7 +177,7 @@ namespace FastLinkDirectTool.Tests
             {
                 fake.StopBehavior=delegate{entered.Set();if(!release.WaitOne(4000))throw new Exception("fixture wait timeout");fake.Active=fake.Armed=fake.Pending=false;return new DualOperationResult{Success=true,Message="fixture clean"};};
                 HiddenShow(form);Click(form,"停用 / 恢复清理");
-                try{Pump(()=>entered.WaitOne(0));Click(form,"退出助手");form.Close();Application.DoEvents();if(fake.Stops!=1)throw new Exception("Queued exit started overlapping cleanup");}
+                try{Pump(()=>entered.WaitOne(0));Click(form,"退出助手");Application.DoEvents();if(fake.Stops!=1)throw new Exception("Queued exit started overlapping cleanup");}
                 finally{release.Set();}
                 Pump(()=>form.IsDisposed);
                 if(fake.Stops!=1||!form.RequestedApplicationExit)throw new Exception("Queued exit cleaned an already clean session twice");
@@ -189,7 +199,7 @@ namespace FastLinkDirectTool.Tests
                 fake.BeforeArm=delegate{entered.Set();if(!release.WaitOne(4000))throw new Exception("fixture wait timeout");};
                 HiddenShow(form);foreach(CheckBox box in Controls(form).OfType<CheckBox>())box.Checked=!box.Text.StartsWith("公司接口");
                 Click(form,"准备公司与外网");
-                try{Pump(()=>entered.WaitOne(0));Click(form,"退出助手");form.Close();Application.DoEvents();if(fake.Stops!=0)throw new Exception("Exit overlapped pending prepare");}
+                try{Pump(()=>entered.WaitOne(0));Click(form,"退出助手");Application.DoEvents();if(fake.Stops!=0)throw new Exception("Exit overlapped pending prepare");}
                 finally{release.Set();}
                 Pump(()=>form.IsDisposed);
                 if(fake.Arms!=1||fake.Stops!=1||!fake.LastStopApproval)throw new Exception("Queued exit after prepare did not perform exactly one approved cleanup");
@@ -216,7 +226,7 @@ namespace FastLinkDirectTool.Tests
                     HiddenShow(form);
                     var all = Controls(form).ToList();
                     if (all.OfType<DataGridView>().Single().Rows.Count != source.Count + 1) throw new Exception("Lost imported rules");
-                    if (all.OfType<Button>().Count() != 7) throw new Exception("Missing action buttons");
+                    if (all.OfType<Button>().Count() != 10) throw new Exception("Missing action buttons");
                     if (!all.OfType<TextBox>().Any(t => t.Text.Contains("未查询或更改真实网络"))) throw new Exception("Preview startup was not isolated");
                     foreach (Button b in all.OfType<Button>()) Click(b);
                     if (!all.OfType<TextBox>().Any(t => t.Text.Contains("未查询或更改真实网络"))) throw new Exception("Preview action changed state");
@@ -231,7 +241,7 @@ namespace FastLinkDirectTool.Tests
                     form.Close();
                 }
                 SessionCases(source);
-                int exitCases=ExitCases(source)+ModeThreeAndArchiveCases(source)+RememberedPermissionCases(source)+TrayCases(source);
+                int exitCases=ExitCases(source)+ModeThreeAndArchiveCases(source)+RememberedPermissionCases(source)+TrayCases(source)+SimplifiedUiCases(source,args.Length==1?args[0]:null)+ExplicitIntentCases(source)+MainRuleEditorCases(source,args.Length==1?args[0]:null)+PreparedValidationCases(source);
                 var migrated = DualRuleMigration.Propose(source);
                 Console.WriteLine("DUAL_UI_TESTS_OK "+(11+exitCases)+"; rules=" + migrated.Count + "; corporate=" + migrated.Count(r => r.Target == RuleTarget.Corporate) + "; internet=" + migrated.Count(r => r.Target == RuleTarget.Internet) + "; review=" + migrated.Count(r => r.Target == RuleTarget.Review));
                 return 0;
@@ -269,8 +279,8 @@ namespace FastLinkDirectTool.Tests
                 Click(form,"准备公司与外网");Pump(()=>modeFake.Arms==1&&Button(form,"检查状态").Enabled);
                 if(modeFake.LastRequest.Mode!=WorkMode.WifiCorporateWiredInternet||modeFake.LastRequest.CorporateAdapterId!="22222222-2222-2222-2222-222222222222"||modeFake.LastRequest.InternetAdapterId!="11111111-1111-1111-1111-111111111111"||modeFake.Starts!=0)
                     throw new Exception("Mode three did not preserve the explicitly selected reversed roles");
-                if(!Controls(form).OfType<Label>().Any(l=>l.Text.Contains("IPv4")&&l.Text.Contains("IPv6")))
-                    throw new Exception("IPv4-only company split limitation was not visible");
+                if(!Controls(form).OfType<Label>().Any(l=>l.Text.Contains("开始分流")&&l.Text.Contains("准入")))
+                    throw new Exception("Start did not visibly explain the current admission assertion");
             }
             passed++;Console.WriteLine("PASS mode three prepares explicit Wi-Fi company and wired Internet roles without enabling");
             return passed;
@@ -284,6 +294,436 @@ namespace FastLinkDirectTool.Tests
             var profile=Field<DualModeProfile>(form,"profile");var platform=Field<DualNetworkWindowsPlatform>(form,"platform");
             profile.RecordPermission(platform.ScopeIdentity,profile.CorporateAdapterId,profile.InternetAdapterId,
                 DateTime.UtcNow,DualPermissionSource.PriorExplicitConversationConsent);
+        }
+        private static void AssertNoSessionWork(FakeSession fake,string context)
+        {
+            if(fake.Arms!=0||fake.Starts!=0||fake.Stops!=0||fake.Validations!=0||fake.Reviews!=0||fake.Archives!=0)
+                throw new Exception(context+" changed the fake network session");
+        }
+        private static void CaptureFixture(DualModeForm form,string path,string suffix)
+        {
+            if(string.IsNullOrEmpty(path))return;
+            string target=Path.Combine(Path.GetDirectoryName(Path.GetFullPath(path)),Path.GetFileNameWithoutExtension(path)+suffix+".png");
+            using(Bitmap bitmap=new Bitmap(form.Width,form.Height))
+            { form.DrawToBitmap(bitmap,new Rectangle(Point.Empty,form.Size));bitmap.Save(target,System.Drawing.Imaging.ImageFormat.Png); }
+        }
+        private static int SimplifiedUiCases(List<string> source,string imagePath)
+        {
+            int passed=0;var fake=new FakeSession();
+            using(var form=new DualModeForm(source,delegate{},true,fake))
+            {
+                // The runner launches this whole fake executable on a separate,
+                // non-input desktop. A real visible form makes Visible checks
+                // meaningful; it never instantiates the production MainForm.
+                form.Opacity=0;form.StartPosition=FormStartPosition.Manual;form.Location=new Point(-30000,-30000);
+                form.Show();Application.DoEvents();
+                foreach(DataGridViewRow row in Field<DataGridView>(form,"rules").Rows)
+                    if(!row.IsNewRow&&Convert.ToString(row.Cells[1].Value)=="待确认")row.Cells[1].Value="公司内网";
+                IntPtr original=form.Handle;
+                if(Controls(form).OfType<CheckBox>().Any(b=>b.Visible)||Field<Panel>(form,"settingsPanel").Visible||Field<bool>(form,"settingsExpanded"))
+                    throw new Exception("Daily UI exposed a checklist or expanded settings by default");
+                if(!Field<Button>(form,"enableAction").Visible||!Field<Button>(form,"stopAction").Visible||!Field<Button>(form,"settingsAction").Visible)
+                    throw new Exception("Collapsed UI hid a primary action");
+                if(!Field<DataGridView>(form,"rules").Visible||Field<DataGridView>(form,"rules").Parent!=Field<TableLayoutPanel>(form,"rootLayout")||
+                    !Field<Button>(form,"addRuleAction").Visible||!Field<Button>(form,"deleteRuleAction").Visible||!Field<Button>(form,"saveAction").Visible)
+                    throw new Exception("Home screen did not keep rules and Add/Delete/Save visible");
+                if(Field<Button>(form,"saveAction").Text!="保存规则")throw new Exception("Home rule Save label was not updated");
+                if(Field<Button>(form,"enableAction").Text!="开始分流"||Field<Button>(form,"stopAction").Text!="停止分流")
+                    throw new Exception("Daily action labels were not simplified");
+                CaptureFixture(form,imagePath,"-collapsed");
+                for(int i=0;i<3;i++)
+                {
+                    Click(Field<Button>(form,"settingsAction"));Application.DoEvents();
+                    if(!Field<Panel>(form,"settingsPanel").Visible||!Field<bool>(form,"settingsExpanded")||!Field<DataGridView>(form,"rules").Visible)
+                        throw new Exception("Settings did not expose the existing rule editor");
+                    if(Controls(form).OfType<CheckBox>().Any(b=>b.Visible))throw new Exception("Expanded settings reintroduced checklists");
+                    if(i==0)CaptureFixture(form,imagePath,"-settings");
+                    Click(Field<Button>(form,"settingsAction"));Application.DoEvents();
+                    if(Field<Panel>(form,"settingsPanel").Visible||Field<bool>(form,"settingsExpanded")||form.Handle!=original||!Field<DataGridView>(form,"rules").Visible)
+                        throw new Exception("Settings collapse rebuilt the window or failed to collapse");
+                    AssertNoSessionWork(fake,"Settings toggle");
+                }
+                if(Field<CheckBox>(form,"admission").Checked||Field<CheckBox>(form,"externalOk").Checked)
+                    throw new Exception("Visibility changes fabricated admission or Internet proof");
+                passed++;Console.WriteLine("PASS daily home keeps rules Add Delete Save visible while hiding checklists and settings toggles do zero network work");
+                // Fake-only fixtures keep the existing runtime gate explicit;
+                // no checkbox clicks or real admission/profile IO are used.
+                Field<CheckBox>(form,"permitted").Checked=true;
+                Field<CheckBox>(form,"admission").Checked=true;
+                Field<CheckBox>(form,"externalOk").Checked=true;
+                Invoke(form,"RequestFromUi");Invoke(form,"ConfirmExplicitRuleChoice");
+                Click(Field<Button>(form,"enableAction"));Pump(()=>fake.Starts==1&&!Field<bool>(form,"working"));
+                if(Field<bool>(form,"settingsExpanded")||!form.HasOwnedState||!Field<Button>(form,"stopAction").Visible)
+                    throw new Exception("Collapsed Start lost active ownership or hid Stop");
+                Click(Field<Button>(form,"stopAction"));Pump(()=>fake.Stops==1&&!Field<bool>(form,"working"));
+                if(fake.Arms!=0||fake.Starts!=1||fake.Stops!=1||form.HasOwnedState||form.IsDisposed)
+                    throw new Exception("Collapsed Start/Stop did not use exactly one fake operation each");
+                passed++;Console.WriteLine("PASS collapsed Start and Stop remain usable with the existing fake runtime gate");
+            }
+            foreach(string bad in new[]{"review","invalid"})
+            {
+                fake=new FakeSession();
+                using(var form=new DualModeForm(source,delegate{},true,fake))
+                {
+                    HiddenShow(form);var grid=Field<DataGridView>(form,"rules");
+                    if(bad=="review")grid.Rows[0].Cells[1].Value="待确认";else grid.Rows[0].Cells[0].Value="not a valid host";
+                    Invoke(form,"RequestFromUi");bool rejected=false;
+                    try{Invoke(form,"ConfirmExplicitRuleChoice");}catch(TargetInvocationException error){if(error.InnerException is InvalidOperationException)rejected=true;else throw;}
+                    if(!rejected||Field<CheckBox>(form,"confirmed").Checked||Field<DualModeProfile>(form,"profile").RulesConfirmed)
+                        throw new Exception("Explicit rule confirmation accepted "+bad+" classification");
+                    AssertNoSessionWork(fake,"Rejected rule confirmation");
+                }
+                passed++;Console.WriteLine("PASS explicit rule confirmation rejects "+bad+" without profile or network writes");
+            }
+            fake=new FakeSession();
+            using(var form=new DualModeForm(source,delegate{},true,fake))
+            {
+                HiddenShow(form);Invoke(form,"RequestFromUi");Invoke(form,"ConfirmExplicitRuleChoice");
+                if(!Field<CheckBox>(form,"confirmed").Checked||!Field<DualModeProfile>(form,"profile").RulesConfirmed||Field<CheckBox>(form,"admission").Checked)
+                    throw new Exception("Valid rule confirmation failed or implied admission");
+                Field<DataGridView>(form,"rules").Rows[0].Cells[1].Value="互联网";
+                if(Field<CheckBox>(form,"confirmed").Checked)throw new Exception("Rule edit silently retained prior acknowledgement");
+                Invoke(form,"RequestFromUi");Invoke(form,"ConfirmExplicitRuleChoice");
+                if(!Field<CheckBox>(form,"confirmed").Checked)throw new Exception("Explicit reconfirmation of edited classified rules failed");
+                Click(Field<Button>(form,"saveAction"));AssertNoSessionWork(fake,"Offline Save");
+            }
+            passed++;Console.WriteLine("PASS classified rules can be explicitly reconfirmed and offline Save never writes or runs the session");
+            return passed;
+        }
+        private static string GridDraft(DataGridView grid)
+        {
+            return string.Join("\n",grid.Rows.Cast<DataGridViewRow>().Where(r=>!r.IsNewRow)
+                .Select(r=>Convert.ToString(r.Cells[0].Value)+"|"+Convert.ToString(r.Cells[1].Value)).ToArray());
+        }
+        private static void EditRuleText(DataGridView grid,int index,string value)
+        {
+            grid.CurrentCell=grid.Rows[index].Cells[0];
+            if(!grid.BeginEdit(true)||!(grid.EditingControl is DataGridViewTextBoxEditingControl))
+                throw new Exception("Fixture could not begin a real rule text cell edit");
+            grid.EditingControl.Text=value;
+            if(!grid.EndEdit())throw new Exception("Fixture could not commit a rule text cell edit");
+            Application.DoEvents();
+            if(Convert.ToString(grid.Rows[index].Cells[0].Value)!=value)throw new Exception("Rule cell did not retain the typed value");
+        }
+        private static void EditRuleTarget(DataGridView grid,int index,string value)
+        {
+            grid.CurrentCell=grid.Rows[index].Cells[1];
+            if(!grid.BeginEdit(true)||!(grid.EditingControl is DataGridViewComboBoxEditingControl))
+                throw new Exception("Fixture could not begin the target selector edit");
+            ((DataGridViewComboBoxEditingControl)grid.EditingControl).SelectedItem=value;
+            grid.NotifyCurrentCellDirty(true);
+            if(!grid.EndEdit())throw new Exception("Fixture could not commit the target selector edit");
+            Application.DoEvents();
+            if(Convert.ToString(grid.Rows[index].Cells[1].Value)!=value)throw new Exception("Rule target selector lost its selected value");
+        }
+        private static int MainRuleEditorCases(List<string> source,string imagePath)
+        {
+            int passed=0;string originalSource=string.Join("\n",source.ToArray());var fake=new FakeSession();
+            using(var form=new DualModeForm(source,delegate{},true,fake,null,false,delegate{return true;},true))
+            {
+                form.Opacity=0;form.StartPosition=FormStartPosition.Manual;form.Location=new Point(-30000,-30000);
+                form.Show();Application.DoEvents();
+                var grid=Field<DataGridView>(form,"rules");
+                foreach(DataGridViewRow row in grid.Rows)if(!row.IsNewRow&&Convert.ToString(row.Cells[1].Value)=="待确认")row.Cells[1].Value="公司内网";
+                Click(Field<Button>(form,"saveAction"));
+                if(!Field<CheckBox>(form,"confirmed").Checked)throw new Exception("Initial fake rules were not saved/acknowledged");
+                int originalCount=grid.Rows.Count;string originalDraft=GridDraft(grid);
+                Click(Field<Button>(form,"addRuleAction"));
+                int added=grid.CurrentCell.RowIndex;
+                if(grid.Rows.Count!=originalCount+1||Convert.ToString(grid.Rows[added].Cells[0].Value)!=""||Convert.ToString(grid.Rows[added].Cells[1].Value)!="待确认"||Field<CheckBox>(form,"confirmed").Checked)
+                    throw new Exception("Add did not append an unclassified blank rule and revoke acknowledgement");
+                EditRuleText(grid,added,"new-service.example.test");
+                if(Convert.ToString(grid.Rows[added].Cells[1].Value)!="待确认")throw new Exception("Typing a hostname inferred its network role");
+                Click(Field<Button>(form,"saveAction"));
+                if(Field<CheckBox>(form,"confirmed").Checked||!Field<TextBox>(form,"details").Text.Contains("保存失败"))
+                    throw new Exception("Save accepted a new unclassified rule");
+                AssertNoSessionWork(fake,"Add and rejected offline Save");
+                passed++;Console.WriteLine("PASS home Add creates a blank Review rule and typing does not infer its route or start the session");
+                var status=Field<Label>(form,"operationStatus");
+                if(Field<bool>(form,"settingsExpanded")||!status.Visible||status.Parent!=Field<TableLayoutPanel>(form,"rootLayout")||!status.Text.Contains("保存失败"))
+                    throw new Exception("Unclassified Save failure was not visible on the collapsed home screen");
+                Application.DoEvents();CaptureFixture(form,imagePath,"-save-failed");
+                passed++;Console.WriteLine("PASS collapsed home exposes unclassified Save failure without opening settings or logs");
+
+                EditRuleTarget(grid,added,"互联网");Click(Field<Button>(form,"saveAction"));
+                var profile=Field<DualModeProfile>(form,"profile");
+                if(!Field<CheckBox>(form,"confirmed").Checked||!profile.Rules.Any(r=>r.Pattern=="new-service.example.test"&&r.Target==RuleTarget.Internet))
+                    throw new Exception("Home Save lost the explicit new target classification");
+                if(Field<bool>(form,"settingsExpanded")||!status.Visible||!status.Text.Contains("离线确认规则分类")||status.Text.Contains("保存失败"))
+                    throw new Exception("Successful offline Save did not replace the prior failure on the collapsed home screen");
+                Application.DoEvents();CaptureFixture(form,imagePath,"-save-confirmed");
+                passed++;Console.WriteLine("PASS collapsed home visibly replaces the Save failure with the next successful rule confirmation");
+                EditRuleText(grid,added,"renamed-service.example.test");
+                if(Field<CheckBox>(form,"confirmed").Checked)throw new Exception("Text editing retained old classification acknowledgement");
+                EditRuleTarget(grid,added,"公司内网");Click(Field<Button>(form,"saveAction"));
+                if(!profile.Rules.Any(r=>r.Pattern=="renamed-service.example.test"&&r.Target==RuleTarget.Corporate)||profile.Rules.Any(r=>r.Pattern=="new-service.example.test"))
+                    throw new Exception("Text/target edits were not captured by explicit Save");
+                AssertNoSessionWork(fake,"Rule text target editing and offline Save");
+                passed++;Console.WriteLine("PASS home text and combo edits persist only in the fake draft when explicitly saved");
+
+                grid.ClearSelection();grid.Rows[added].Selected=true;Click(Field<Button>(form,"deleteRuleAction"));
+                if(grid.Rows.Count!=originalCount||GridDraft(grid)!=originalDraft||Field<CheckBox>(form,"confirmed").Checked)
+                    throw new Exception("Delete selected did not remove only the added rule or revoke acknowledgement");
+                Click(Field<Button>(form,"saveAction"));
+                if(profile.Rules.Any(r=>r.Pattern=="renamed-service.example.test"))throw new Exception("Deleted row survived draft Save");
+                AssertNoSessionWork(fake,"Delete selected");
+                passed++;Console.WriteLine("PASS home Delete removes only the selected rule and explicit Save captures deletion");
+
+                string untouched=Convert.ToString(grid.Rows[1].Cells[0].Value);
+                grid.ClearSelection();grid.Rows[0].Selected=true;grid.Rows[2].Selected=true;
+                Click(Field<Button>(form,"deleteRuleAction"));
+                if(grid.Rows.Count!=originalCount-2||!grid.Rows.Cast<DataGridViewRow>().Any(r=>!r.IsNewRow&&Convert.ToString(r.Cells[0].Value)==untouched))
+                    throw new Exception("Multi-row deletion removed an unselected row or shifted indices incorrectly");
+                string afterDelete=GridDraft(grid);grid.ClearSelection();Click(Field<Button>(form,"deleteRuleAction"));
+                if(GridDraft(grid)!=afterDelete||!Field<TextBox>(form,"details").Text.Contains("请先选中"))throw new Exception("Empty selection Delete changed the draft");
+                AssertNoSessionWork(fake,"Multi-row and empty selection Delete");
+                passed++;Console.WriteLine("PASS Delete supports disjoint selected rows and leaves an empty selection unchanged");
+
+                int typed=grid.NewRowIndex;EditRuleText(grid,typed,"typed-row.example.test");
+                if(Convert.ToString(grid.Rows[typed].Cells[1].Value)!="待确认")throw new Exception("Direct new-row editing did not default to Review");
+                Click(Field<Button>(form,"saveAction"));
+                if(Field<CheckBox>(form,"confirmed").Checked)throw new Exception("Save accepted an unclassified directly typed row");
+                AssertNoSessionWork(fake,"Direct new-row typing");
+                passed++;Console.WriteLine("PASS direct new-row typing defaults to Review just like the Add button");
+                if(string.Join("\n",source.ToArray())!=originalSource)throw new Exception("Rule editor changed the original legacy rule source list");
+            }
+            foreach(string state in new[]{"busy","running","armed","pending","legacy","closing"})
+            {
+                fake=new FakeSession{Active=state=="running",Armed=state=="running"||state=="armed",Pending=state=="pending"};
+                using(var form=new DualModeForm(source,delegate{},true,fake))
+                {
+                    HiddenShow(form);var grid=Field<DataGridView>(form,"rules");
+                    if(state=="legacy")Field<ComboBox>(form,"mode").SelectedIndex=0;
+                    if(state=="busy")Invoke(form,"SetWorking",true);
+                    if(state=="closing")typeof(DualModeForm).GetField("closing",BindingFlags.Instance|BindingFlags.NonPublic).SetValue(form,true);
+                    string before=GridDraft(grid);int beforeCount=grid.Rows.Count;
+                    if(state!="closing"&&(!grid.ReadOnly||grid.AllowUserToAddRows||grid.AllowUserToDeleteRows||Field<Button>(form,"addRuleAction").Enabled||Field<Button>(form,"deleteRuleAction").Enabled))
+                        throw new Exception("Rule editing gate was open in state "+state);
+                    if(state=="busy"&&Field<Button>(form,"saveAction").Enabled)throw new Exception("Save stayed enabled during pending work");
+                    grid.ClearSelection();if(grid.Rows.Count>0)grid.Rows[0].Selected=true;
+                    Click(Field<Button>(form,"addRuleAction"));Click(Field<Button>(form,"deleteRuleAction"));
+                    // Direct invocation also checks the action's own defensive
+                    // gate, not merely the button's current Enabled property.
+                    Invoke(form,"AddRule");Invoke(form,"DeleteSelectedRules");
+                    if(GridDraft(grid)!=before||grid.Rows.Count!=beforeCount)throw new Exception("Protected rule actions changed the draft in state "+state);
+                    if(state!="closing")
+                    { grid.CurrentCell=grid.Rows[0].Cells[0];if(grid.BeginEdit(true))throw new Exception("Read-only cell accepted editing in state "+state); }
+                    if(state=="legacy"&&!Field<Label>(form,"ruleHint").Text.Contains("双网草稿"))throw new Exception("Legacy mode obscured that the shown table is the dual-mode draft");
+                    AssertNoSessionWork(fake,"Protected editing "+state);
+                }
+                passed++;Console.WriteLine("PASS rule Add Delete and cell editing are protected without session work state="+state);
+            }
+            return passed;
+        }
+        private static int ExplicitIntentCases(List<string> source)
+        {
+            int passed=0;
+            foreach(bool allowAfterExit in new[]{false,true})
+            {
+                var fake=new FakeSession();DualModeForm current=null;int prompts=0;
+                using(var form=new DualModeForm(source,delegate{},true,fake,null,false,delegate
+                {
+                    prompts++;Click(Field<Button>(current,"exitAction"));
+                    if(!Field<bool>(current,"closeQueued"))throw new Exception("Permission fixture failed to queue explicit Exit");
+                    return allowAfterExit;
+                },true))
+                {
+                    current=form;HiddenShow(form);Click(Field<Button>(form,"enableAction"));Application.DoEvents();
+                    if(prompts!=1||fake.Arms!=0||fake.Starts!=0||fake.Stops!=0||!form.RequestedApplicationExit||!form.IsDisposed)
+                        throw new Exception("Permission response after queued Exit started the session or failed to close safely allow="+allowAfterExit);
+                }
+                passed++;Console.WriteLine("PASS permission response after queued Exit never starts a network session allow="+allowAfterExit);
+            }
+            foreach(bool allow in new[]{false,true})
+            {
+                int prompts=0;var fake=new FakeSession();
+                using(var form=new DualModeForm(source,delegate{},true,fake,null,false,delegate{prompts++;return allow;},true))
+                {
+                    HiddenShow(form);
+                    if(Field<CheckBox>(form,"admission").Checked||Field<CheckBox>(form,"confirmed").Checked)
+                        throw new Exception("Opening an explicit-intent fixture fabricated acknowledgement");
+                    Invoke(form,"MinimizeToTray");Invoke(form,"RestoreFromTray");Click(Field<Button>(form,"settingsAction"));Click(Field<Button>(form,"settingsAction"));
+                    if(prompts!=0||Field<CheckBox>(form,"admission").Checked)throw new Exception("Visibility requested company permission or admission");
+                    Click(Field<Button>(form,"enableAction"));
+                    if(allow)Pump(()=>fake.Starts==1&&!Field<bool>(form,"working"));else Application.DoEvents();
+                    if(prompts!=1||fake.Starts!=(allow?1:0)||fake.Arms!=0||fake.Stops!=0)
+                        throw new Exception("Explicit Start did not scope company permission to the action");
+                    var platform=Field<DualNetworkWindowsPlatform>(form,"platform");
+                    if(Field<CheckBox>(form,"admission").Checked!=allow||platform.CorporateAdmissionConfirmed!=allow||Field<CheckBox>(form,"permitted").Checked!=allow)
+                        throw new Exception("Start approval/cancellation fabricated or lost admission intent");
+                    if(!Field<CheckBox>(form,"confirmed").Checked||!Field<DualModeProfile>(form,"profile").RulesConfirmed||platform.InternetConfirmed||Field<CheckBox>(form,"externalOk").Checked)
+                        throw new Exception("Explicit Start missed rule acknowledgement or invented Internet proof");
+                    if(allow)
+                    {
+                        Click(Field<Button>(form,"stopAction"));Pump(()=>fake.Stops==1&&!Field<bool>(form,"working"));
+                        Click(Field<Button>(form,"enableAction"));Pump(()=>fake.Starts==2&&!Field<bool>(form,"working"));
+                        if(prompts!=1)throw new Exception("Repeated Start for the same in-memory scope repeated company permission");
+                    }
+                }
+                passed++;Console.WriteLine("PASS explicit Start "+(allow?"accepts":"cancels")+" company permission without hidden checklist or invented Internet verification");
+            }
+            foreach(bool enable in new[]{false,true})
+            {
+                int prompts=0;var fake=new FakeSession();
+                using(var form=new DualModeForm(source,delegate{},true,fake,null,false,delegate{prompts++;return true;},true))
+                {
+                    HiddenShow(form);Field<DataGridView>(form,"rules").Rows[0].Cells[1].Value="待确认";
+                    Click(Field<Button>(form,enable?"enableAction":"prepareAction"));Application.DoEvents();
+                    if(prompts!=0||!Field<bool>(form,"settingsExpanded")||Field<CheckBox>(form,"confirmed").Checked||Field<CheckBox>(form,"admission").Checked)
+                        throw new Exception("Unclassified explicit action asked permission or claimed admission");
+                    AssertNoSessionWork(fake,"Unclassified explicit action");
+                }
+                passed++;Console.WriteLine("PASS unclassified "+(enable?"Start":"Prepare")+" opens settings without a permission prompt or session work");
+            }
+            {
+                int prompts=0;var fake=new FakeSession();
+                using(var form=new DualModeForm(source,delegate{},true,fake,null,false,delegate{prompts++;return true;},true))
+                {
+                    HiddenShow(form);Click(Field<Button>(form,"prepareAction"));Pump(()=>fake.Arms==1&&!Field<bool>(form,"working"));
+                    if(prompts!=1||fake.Starts!=0||Field<CheckBox>(form,"admission").Checked||Field<DualNetworkWindowsPlatform>(form,"platform").CorporateAdmissionConfirmed)
+                        throw new Exception("Explicit Prepare was mistaken for admission/full Start");
+                }
+                passed++;Console.WriteLine("PASS explicit Prepare confirms rules and scope but never claims current company admission");
+            }
+            foreach(bool preview in new[]{false,true})
+            {
+                bool rejected=false;
+                try{using(var form=new DualModeForm(source,delegate{},preview,null,null,false,delegate{return true;},true)){} }
+                catch(ArgumentException){rejected=true;}
+                if(!rejected)throw new Exception("Intent injection escaped the offline fake-only boundary");
+                passed++;Console.WriteLine("PASS explicit intent injection rejected without an offline fake session preview="+preview);
+            }
+            foreach(bool classified in new[]{false,true})
+            {
+                int prompts=0;var fake=new FakeSession();
+                using(var form=new DualModeForm(source,delegate{},true,fake,null,false,delegate{prompts++;return true;},true))
+                {
+                    HiddenShow(form);
+                    if(!classified)Field<DataGridView>(form,"rules").Rows[0].Cells[1].Value="待确认";
+                    Click(Field<Button>(form,"saveAction"));Application.DoEvents();
+                    if(Field<CheckBox>(form,"confirmed").Checked!=classified||Field<DualModeProfile>(form,"profile").RulesConfirmed!=classified)
+                        throw new Exception("Save did not acknowledge only fully classified rules");
+                    if(prompts!=0||Field<CheckBox>(form,"admission").Checked||Field<CheckBox>(form,"permitted").Checked||Field<CheckBox>(form,"externalOk").Checked)
+                        throw new Exception("Saving rules claimed permission, admission or live Internet proof");
+                    if(!Controls(form).OfType<TextBox>().Any(t=>t.Text.Contains(classified?"离线确认规则分类":"保存失败")))
+                        throw new Exception("Offline Save did not exercise the explicit rule confirmation branch");
+                    AssertNoSessionWork(fake,"Explicit offline Save");
+                }
+                passed++;Console.WriteLine("PASS explicit Save classified="+classified+" checks rules without profile IO or admission assertion");
+            }
+            foreach(bool lockBusy in new[]{false,true})
+            {
+                var fake=new FakeSession{Active=true,Armed=true,Pending=lockBusy};
+                fake.ValidateBehavior=delegate{return new DualOperationResult{Success=false,Pending=false,State="ReadDeferred",Message="fake transient read busy"};};
+                using(var form=new DualModeForm(source,delegate{},true,fake))
+                {
+                    HiddenShow(form);Field<CheckBox>(form,"admission").Checked=Field<CheckBox>(form,"externalOk").Checked=true;
+                    for(int i=0;i<2;i++){Invoke(form,"RefreshReadOnly");Pump(()=>!Field<bool>(form,"working"));}
+                    if(fake.Validations!=2||fake.Stops!=0||Field<bool>(form,"automaticChecksPaused")||!Field<CheckBox>(form,"admission").Checked||!Field<CheckBox>(form,"externalOk").Checked)
+                        throw new Exception("ReadDeferred falsely revoked topology confirmation or paused the UI");
+                }
+                passed++;Console.WriteLine("PASS transient ReadDeferred does not masquerade as topology change or clean the network lockBusy="+lockBusy);
+            }
+            {
+                var fake=new FakeSession{Active=true,Armed=true,Pending=true};
+                using(var entered=new ManualResetEvent(false))using(var release=new ManualResetEvent(false))
+                using(var form=new DualModeForm(source,delegate{},true,fake))
+                {
+                    HiddenShow(form);
+                    fake.ValidateBehavior=delegate
+                    { entered.Set();if(!release.WaitOne(4000))throw new Exception("fixture pending read timeout");return new DualOperationResult{Success=false,Pending=true,State="InternetProtected",Message="original fixture failure retained"}; };
+                    Stopwatch watch=Stopwatch.StartNew();Invoke(form,"RefreshReadOnly");
+                    try
+                    {
+                        if(watch.ElapsedMilliseconds>500)throw new Exception("Pending status synchronously blocked the UI");
+                        Pump(()=>entered.WaitOne(0));Invoke(form,"MinimizeToTray");Invoke(form,"RestoreFromTray");
+                        if(fake.Validations!=1||fake.Stops!=0||form.IsDisposed||!Field<bool>(form,"working"))
+                            throw new Exception("Pending read blocked tray UI or initiated cleanup");
+                    }
+                    finally{release.Set();}
+                    Pump(()=>!Field<bool>(form,"working"));
+                    if(!Field<TextBox>(form,"details").Text.Contains("original fixture failure retained"))
+                        throw new Exception("Pending asynchronous status lost the original failure evidence");
+                }
+                passed++;Console.WriteLine("PASS pending status uses asynchronous fake read and leaves tray operations responsive");
+            }
+            return passed;
+        }
+        private static int PreparedValidationCases(List<string> source)
+        {
+            int passed = 0;
+            {
+                var fake = new FakeSession { Armed = true };
+                using (var form = new DualModeForm(source, delegate { }, true, fake))
+                {
+                    HiddenShow(form); GrantPreviewPermission(form);
+                    var profile = Field<DualModeProfile>(form, "profile");
+                    var snapshot = new NetworkSnapshot { Adapters = new List<AdapterSnapshot> {
+                        new AdapterSnapshot { Id = profile.CorporateAdapterId, Name = "fixture corporate connected", Kind = LinkKind.Ethernet,
+                            IsPhysical = true, IsUp = true, Address = "192.0.2.20", PrefixLength = 24, Gateway = "192.0.2.1" },
+                        new AdapterSnapshot { Id = profile.InternetAdapterId, Name = "fixture external", Kind = LinkKind.Wifi,
+                            IsPhysical = true, IsUp = true, Address = "198.51.100.20", PrefixLength = 24, Gateway = "198.51.100.1" } } };
+                    fake.ValidateBehavior = delegate { return new DualOperationResult { Success = true, State = "Armed",
+                        Message = "fixture verified connected adapters", VerifiedPreparationSnapshot = snapshot }; };
+                    typeof(DualModeForm).GetField("confirmedTopology", BindingFlags.Instance | BindingFlags.NonPublic).SetValue(form, "old disconnected snapshot");
+                    Field<CheckBox>(form, "admission").Checked = Field<CheckBox>(form, "externalOk").Checked = true;
+                    Invoke(form, "RefreshReadOnly"); Pump(() => !Field<bool>(form, "working"));
+                    if (!Field<Label>(form, "connectionSummary").Text.Contains("192.0.2.20") ||
+                        Field<CheckBox>(form, "admission").Checked || Field<CheckBox>(form, "externalOk").Checked ||
+                        fake.Validations != 1 || fake.Starts != 0 || fake.Arms != 0 || fake.Stops != 0)
+                        throw new Exception("Prepared display did not refresh verified link state or reused admission after topology change");
+                }
+                passed++; Console.WriteLine("PASS prepared verified snapshot updates interface display without granting admission or changing network");
+            }
+            foreach (string outcome in new[] { "verified", "deferred", "drift", "error" })
+            {
+                var fake = new FakeSession { Armed = true };
+                fake.ValidateBehavior = delegate
+                {
+                    if (outcome == "error") throw new InvalidOperationException("fixture prepared read failed");
+                    if (outcome == "drift") { fake.Armed = false; fake.Pending = true; }
+                    return new DualOperationResult { Success = outcome == "verified", Pending = outcome == "drift",
+                        State = outcome == "deferred" ? "ReadDeferred" : outcome == "drift" ? "PreparedInvalidated" : "Armed",
+                        Message = outcome == "verified" ? "fixture prepared metrics verified" : "fixture preparation unverified " + outcome };
+                };
+                using (var form = new DualModeForm(source, delegate { }, true, fake))
+                {
+                    HiddenShow(form);
+                    Invoke(form, "RefreshReadOnly"); Pump(() => !Field<bool>(form, "working"));
+                    if (fake.Validations != 1 || fake.Arms != 0 || fake.Starts != 0 || fake.Stops != 0)
+                        throw new Exception("Prepared status bypassed runtime validation or performed automatic network work");
+                    string summary = Field<Label>(form, "modeNotice").Text;
+                    if (summary.Contains("已准备") != (outcome == "verified"))
+                        throw new Exception("Prepared success label did not reflect read verification: " + outcome);
+                    bool shouldPause = outcome == "drift" || outcome == "error";
+                    if (Field<bool>(form, "automaticChecksPaused") != shouldPause)
+                        throw new Exception("Prepared read failure used the wrong retry policy: " + outcome);
+                    if (outcome == "deferred")
+                    {
+                        if (!summary.Contains("待核验") || !Field<Label>(form, "operationStatus").Text.Contains("unverified"))
+                            throw new Exception("Deferred preparation warning is not visible on the home page");
+                        fake.ValidateBehavior = delegate { return new DualOperationResult { Success = true, State = "Armed", Message = "fixture verified after retry" }; };
+                        Invoke(form, "RefreshReadOnly"); Pump(() => !Field<bool>(form, "working"));
+                        if (!Field<Label>(form, "modeNotice").Text.Contains("已准备") || fake.Validations != 2 || fake.Stops != 0)
+                            throw new Exception("Successful prepared retry did not clear only the UI warning");
+                    }
+                }
+                passed++; Console.WriteLine("PASS prepared UI validation " + outcome + " is read-only and never claims unverified success");
+            }
+            {
+                var fake = new FakeSession { Armed = true, Pending = true };
+                fake.ValidateBehavior = delegate { return new DualOperationResult { Success = false, State = "ReadDeferred", Message = "fixture prepared lock busy" }; };
+                using (var form = new DualModeForm(source, delegate { }, true, fake))
+                {
+                    HiddenShow(form); Invoke(form, "RefreshReadOnly"); Pump(() => !Field<bool>(form, "working"));
+                    string status = Field<Label>(form, "modeNotice").Text;
+                    if (fake.Validations != 1 || fake.Stops != 0 || Field<bool>(form, "automaticChecksPaused") ||
+                        status.Contains("已准备") || status.Contains("需要检查恢复记录") || !status.Contains("待核验"))
+                        throw new Exception("Conservative lock-busy gate cleaned or claimed prepared success");
+                }
+                passed++; Console.WriteLine("PASS prepared lock-busy gate remains asynchronous with no cleanup or success claim");
+            }
+            return passed;
         }
         private static int RememberedPermissionCases(List<string> source)
         {
@@ -414,11 +854,13 @@ namespace FastLinkDirectTool.Tests
             fake=new FakeSession{Armed=true};
             using(var form=new DualModeForm(source,delegate{},true,fake))
             {
-                HiddenShow(form);Invoke(form,"MinimizeToTray");Invoke(form,"RestoreFromTray");form.Close();Pump(()=>form.IsDisposed);
-                if(fake.Stops!=1||!form.RequestedApplicationExit||form.RequestedLegacyMode)
-                    throw new Exception("Window X became minimize instead of safe exit");
+                HiddenShow(form);Invoke(form,"MinimizeToTray");Invoke(form,"RestoreFromTray");form.Close();Application.DoEvents();
+                if(fake.Stops!=0||form.IsDisposed||form.RequestedApplicationExit||form.RequestedLegacyMode||!TrayState(form))
+                    throw new Exception("Window X did not retain the running session in tray");
+                Invoke(form,"RestoreFromTray");Click(form,"退出助手");Pump(()=>form.IsDisposed);
+                if(fake.Stops!=1||!form.RequestedApplicationExit)throw new Exception("Explicit exit after window X failed to clean");
             }
-            passed++;Console.WriteLine("PASS window X still performs verified cleanup after tray restoration");
+            passed++;Console.WriteLine("PASS window X retains session in tray and only explicit exit performs verified cleanup");
             fake=new FakeSession{Armed=true,FailStop=true};
             using(var form=new DualModeForm(source,delegate{},true,fake))
             {
@@ -443,9 +885,9 @@ namespace FastLinkDirectTool.Tests
                 {
                     Pump(()=>entered.WaitOne(0));Click(form,"退出助手");
                     if(!Field<bool>(form,"closeQueued"))throw new Exception("Fixture did not queue exit");
-                    Invoke(form,"MinimizeToTray");
+                    form.Close();Application.DoEvents();
                     if(Field<bool>(form,"closeQueued")||fake.Stops!=0||form.IsDisposed)
-                        throw new Exception("Minimize did not cancel only the not-yet-started queued exit");
+                        throw new Exception("Window X did not cancel only the not-yet-started queued exit");
                 }
                 finally{release.Set();}
                 Pump(()=>Button(form,"检查状态").Enabled);
@@ -454,7 +896,7 @@ namespace FastLinkDirectTool.Tests
                 Invoke(form,"RestoreFromTray");Click(form,"退出助手");Pump(()=>form.IsDisposed);
                 if(fake.Stops!=1)throw new Exception("Later explicit exit was not one cleanup");
             }
-            passed++;Console.WriteLine("PASS minimizing during work cancels only an exit that has not started");
+            passed++;Console.WriteLine("PASS window X during pending work cancels only an exit that has not started");
             fake=new FakeSession{Armed=true};
             using(ManualResetEvent entered=new ManualResetEvent(false))using(ManualResetEvent release=new ManualResetEvent(false))
             using(var form=new DualModeForm(source,delegate{},true,fake))
@@ -507,14 +949,15 @@ namespace FastLinkDirectTool.Tests
             passed++;Console.WriteLine("PASS transparent modal stays visible and running while minimized without repeated Shown or network work");
             Exception nativeFailure=null;
             foreach(bool active in new[]{false,true})
+            foreach(bool busy in new[]{false,true})
             {
-                try{NativeOwnedModalMinimizeCase(source,active);passed++;}
+                try{NativeOwnedModalMinimizeCase(source,active,busy);passed++;}
                 catch(Exception error){if(nativeFailure==null)nativeFailure=error;}
             }
             if(nativeFailure!=null)throw nativeFailure;
             return passed;
         }
-        private static void NativeOwnedModalMinimizeCase(List<string> source,bool active)
+        private static void NativeOwnedModalMinimizeCase(List<string> source,bool active,bool busy)
         {
             var fake=new FakeSession{Armed=active,Active=active};
             var trace=new List<string>();var watch=Stopwatch.StartNew();
@@ -545,12 +988,13 @@ namespace FastLinkDirectTool.Tests
                     try
                     {
                         if(watch.ElapsedMilliseconds>5000)throw new Exception("Native minimize fixture timed out");
-                        if(!form.Visible||form.ShowInTaskbar||shown!=1||created!=1||destroyed!=0||form.DialogResult!=DialogResult.None||form.RequestedApplicationExit||fake.Stops!=0)
+                        if(owner.Visible||!form.Visible||form.ShowInTaskbar||shown!=1||created!=1||destroyed!=0||form.DialogResult!=DialogResult.None||form.RequestedApplicationExit||fake.Stops!=0||Field<bool>(form,"closeQueued"))
                             throw new Exception("Native tray cycle rebuilt, closed or cleaned the real owned modal");
                         if(originalHandle==IntPtr.Zero)originalHandle=form.Handle;
                         if(form.Handle!=originalHandle)throw new Exception("Native tray cycle changed the modal handle");
                         if(stage==0)
                         {
+                            if(busy&&rounds==0)Invoke(form,"SetWorking",true);
                             stage=1;
                             record("send.SC_MINIMIZE");
                             SendMessage(form.Handle,0x0112,new IntPtr(0xF020),IntPtr.Zero);
@@ -563,29 +1007,45 @@ namespace FastLinkDirectTool.Tests
                                 throw new Exception("Native minimize ended or cleaned the real owned modal");
                             stage=2;Invoke(form,"RestoreFromTray");record("restore");return;
                         }
+                        if(stage==2)
+                        {
+                            if(TrayState(form)||form.WindowState!=FormWindowState.Normal)throw new Exception("Native minimized modal could not restore");
+                            stage=3;record("send.SC_CLOSE");
+                            SendMessage(form.Handle,0x0112,new IntPtr(0xF060),IntPtr.Zero);
+                            record("return.SC_CLOSE");return;
+                        }
+                        if(stage==3)
+                        {
+                            if(!TrayState(form)||form.WindowState!=FormWindowState.Minimized)throw new Exception("Window X did not collect the modal to tray");
+                            stage=4;Invoke(form,"RestoreFromTray");record("restore.after.X");return;
+                        }
                         if(TrayState(form)||form.WindowState!=FormWindowState.Normal)
                             throw new Exception("Native minimized modal did not survive handle recreation and restore");
                         rounds++;
                         if(rounds<3){stage=0;return;}
                         if(fake.Arms!=0||fake.Starts!=0||fake.Validations!=0||form.HasOwnedState!=active)
                             throw new Exception("Native tray cycles modified the runtime session");
+                        if(busy)Invoke(form,"SetWorking",false);
                         AssertPreviewHasNoTrayIcon(form);observed=true;explicitExit=true;ticks.Stop();
                         record("explicit.exit");Click(form,"退出助手");
                     }
                     catch(Exception error){failure=error;ticks.Stop();form.Dispose();}
                 };
-                owner.Show();Application.DoEvents();owner.ShowInTaskbar=false;
+                // Match the production host's UI-only operation: its legacy
+                // owner is hidden before ShowDialog and remains the owner.
+                // Do not construct MainForm: that would initialize real runtime.
+                owner.Show();Application.DoEvents();owner.Hide();
                 ticks.Start();DialogResult result=form.ShowDialog(owner);ticks.Stop();record("ShowDialog.return:"+result);
                 if(!observed||!explicitExit||failure!=null)
                 {
-                    Console.WriteLine("NATIVE_MODAL_TRACE active="+active+" "+string.Join(" || ",trace.ToArray()));
+                    Console.WriteLine("NATIVE_MODAL_TRACE active="+active+" busy="+busy+" "+string.Join(" || ",trace.ToArray()));
                     throw failure??new Exception("Native minimize unexpectedly returned before explicit exit; active="+active);
                 }
-                if(fake.Stops!=(active?1:0)||!form.RequestedApplicationExit)
+                if(owner.Visible||fake.Stops!=(active?1:0)||!form.RequestedApplicationExit)
                     throw new Exception("Native modal final explicit cleanup mismatch");
-                Console.WriteLine("NATIVE_MODAL_TRACE active="+active+" "+string.Join(" || ",trace.ToArray()));
+                Console.WriteLine("NATIVE_MODAL_TRACE active="+active+" busy="+busy+" "+string.Join(" || ",trace.ToArray()));
             }
-            Console.WriteLine("PASS three native SC_MINIMIZE and restore cycles retain owned modal handle active="+active);
+            Console.WriteLine("PASS hidden owner and three native minimize X restore cycles retain modal active="+active+" busy="+busy);
         }
         private static IEnumerable<Control> Controls(Control parent)
         { foreach(Control child in parent.Controls) { yield return child; foreach(Control desc in Controls(child)) yield return desc; } }

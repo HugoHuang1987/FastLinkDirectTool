@@ -18,24 +18,33 @@ using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using System.Xml;
 
-[assembly: AssemblyVersion("2.6.7.0")]
-[assembly: AssemblyFileVersion("2.6.7.0")]
+[assembly: AssemblyVersion("2.6.8.0")]
+[assembly: AssemblyFileVersion("2.6.8.0")]
 
 namespace FastLinkDirectTool
 {
     internal static class Program
     {
-        private const string WindowTitle = "FastLink 直连助手";
-
         [STAThread]
         private static void Main(string[] args)
         {
+            string activationName;
+            using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
+            using (Process current = Process.GetCurrentProcess())
+                activationName = WindowActivationListener.GetEventName(identity.User.Value, current.SessionId);
             bool createdNew;
+            // Local namespace + the current user's SID/session scope this
+            // data-free notification to the same interactive user. Creating it
+            // before the mutex also retains a request during first startup.
+            using (EventWaitHandle activationRequest = new EventWaitHandle(false, EventResetMode.AutoReset, activationName))
             using (Mutex mutex = new Mutex(true, "Global\\FastLinkDirectTool.SingleInstance", out createdNew))
             {
                 if (!createdNew)
                 {
-                    NativeMethods.ShowExistingWindow(WindowTitle);
+                    // All second launches, including --show / --network-mode,
+                    // only restore the currently working UI. They never change
+                    // modes, prepare a network, or begin/stop a session.
+                    activationRequest.Set();
                     return;
                 }
 
@@ -48,31 +57,64 @@ namespace FastLinkDirectTool
 
                 bool openNetworkMode = args.Any(value => string.Equals(value, "--network-mode", StringComparison.OrdinalIgnoreCase));
                 bool prepareNetworkMode = !autoStartLaunch && openNetworkMode && args.Any(value => string.Equals(value, "--prepare-network-mode", StringComparison.OrdinalIgnoreCase));
-                MainForm form = new MainForm(autoStartLaunch, openNetworkMode, prepareNetworkMode);
-                Application.Run(form);
+                using (MainForm form = new MainForm(autoStartLaunch, openNetworkMode, prepareNetworkMode))
+                {
+                    // Ensure BeginInvoke can queue safely even before Run starts
+                    // pumping messages. This does not show or initialize a mode.
+                    IntPtr mainHandle = form.Handle;
+                    using (WindowActivationListener activation = new WindowActivationListener(activationRequest,
+                        delegate(Action action) { form.BeginInvoke(action); }, form.RestoreCurrentWindow))
+                        Application.Run(form);
+                }
             }
         }
     }
 
-    internal static class NativeMethods
+    // UI activation only. The injected dispatcher makes threading/selection
+    // testable without constructing a Form or running any network controller.
+    internal sealed class WindowActivationListener : IDisposable
     {
-        [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
-        private static extern IntPtr FindWindow(string className, string windowName);
+        private readonly RegisteredWaitHandle registration;
+        private int disposed;
 
-        [System.Runtime.InteropServices.DllImport("user32.dll")]
-        private static extern bool ShowWindow(IntPtr window, int command);
-
-        [System.Runtime.InteropServices.DllImport("user32.dll")]
-        private static extern bool SetForegroundWindow(IntPtr window);
-
-        public static void ShowExistingWindow(string title)
+        internal static string GetEventName(string userSid, int sessionId)
         {
-            IntPtr handle = FindWindow(null, title);
-            if (handle != IntPtr.Zero)
+            if (sessionId < 0) throw new ArgumentOutOfRangeException("sessionId");
+            string canonicalSid = new SecurityIdentifier(userSid).Value;
+            return "Local\\FastLinkDirectTool.ShowWindow.v1." + canonicalSid + "." + sessionId.ToString(CultureInfo.InvariantCulture);
+        }
+
+        internal WindowActivationListener(WaitHandle request, Action<Action> postToUi, Action restoreCurrentWindow)
+        {
+            if (request == null) throw new ArgumentNullException("request");
+            if (postToUi == null) throw new ArgumentNullException("postToUi");
+            if (restoreCurrentWindow == null) throw new ArgumentNullException("restoreCurrentWindow");
+            registration = ThreadPool.RegisterWaitForSingleObject(request, delegate
             {
-                ShowWindow(handle, 9);
-                SetForegroundWindow(handle);
-            }
+                if (Interlocked.CompareExchange(ref disposed, 0, 0) != 0) return;
+                try
+                {
+                    postToUi(delegate
+                    {
+                        if (Interlocked.CompareExchange(ref disposed, 0, 0) == 0) restoreCurrentWindow();
+                    });
+                }
+                // The UI may finish closing between the check and BeginInvoke.
+                catch (InvalidOperationException) { }
+            }, null, Timeout.Infinite, false);
+        }
+
+        internal static void RestoreCurrentWindow(Action activeModeRestore, Action mainRestore)
+        {
+            if (mainRestore == null) throw new ArgumentNullException("mainRestore");
+            // Never fall back to the disabled owner while its child is active,
+            // even if the child's restore fails during shutdown.
+            if (activeModeRestore != null) activeModeRestore(); else mainRestore();
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref disposed, 1) == 0) registration.Unregister(null);
         }
     }
 
@@ -2635,6 +2677,8 @@ namespace FastLinkDirectTool
         private bool dualModeSessionSuppressed;
         private bool dualRecoveryPending;
         private bool prepareNetworkModeOnce;
+        private Modes.DualModeForm activeModeWindow;
+        private bool shownInitialized;
 
         public MainForm(bool autoStartLaunch, bool openNetworkMode = false, bool prepareNetworkMode = false)
         {
@@ -2832,6 +2876,10 @@ namespace FastLinkDirectTool
 
             Shown += delegate
             {
+                // Restoring a taskbar-hidden legacy window may recreate its
+                // handle. A show-only request must never rerun startup cleanup.
+                if (shownInitialized) return;
+                shownInitialized = true;
                 busy = true;
                 Task.Run(delegate
                 {
@@ -3715,6 +3763,20 @@ namespace FastLinkDirectTool
             Activate();
         }
 
+        internal void RestoreCurrentWindow()
+        {
+            if (IsDisposed || Disposing || allowExit) return;
+            Action modeRestore = null;
+            if (activeModeWindow != null)
+            {
+                // The child remains authoritative throughout its modal lifetime,
+                // including disposal. Do not reveal its disabled legacy owner.
+                if (activeModeWindow.IsDisposed || activeModeWindow.Disposing) return;
+                modeRestore = activeModeWindow.RestoreFromTray;
+            }
+            WindowActivationListener.RestoreCurrentWindow(modeRestore, ShowFromTray);
+        }
+
         private void ExitAndClean()
         {
             if (dualRecoveryPending)
@@ -3738,6 +3800,10 @@ namespace FastLinkDirectTool
                     {
                         string message = "安全清理未完成，助手保持运行，请重试退出：" + task.Exception.GetBaseException().Message;
                         SafeLog(message);
+                        // A dual-mode exit keeps the legacy window hidden.
+                        // If its final cleanup fails, leave a visible recovery
+                        // entry instead of an inaccessible background process.
+                        if (!Visible) { trayIcon.Visible = true; ShowFromTray(); }
                         trayIcon.ShowBalloonTip(5000, "FastLink 直连助手", message, ToolTipIcon.Error);
                         RefreshUi();
                         return;
@@ -3777,6 +3843,7 @@ namespace FastLinkDirectTool
                     return;
                 }
                 bool exitRequested = false;
+                bool mainTrayWasVisible = trayIcon.Visible;
                 try
                 {
                     // Modal ownership keeps the legacy monitor/UI from mutating
@@ -3786,21 +3853,15 @@ namespace FastLinkDirectTool
                     prepareNetworkModeOnce = false;
                     using (Modes.DualModeForm form = new Modes.DualModeForm(config.Rules, SafeLog, prepareOnOpen: prepareOnce))
                     {
-                        bool mainTrayWasVisible = trayIcon.Visible;
-                        bool mainTaskbarWasVisible = ShowInTaskbar;
-                        try
-                        {
-                            // The modal mode window owns the one visible tray
-                            // icon. Its minimize/restore never starts cleanup.
-                            trayIcon.Visible = false;
-                            ShowInTaskbar = false;
-                            form.ShowDialog(this);
-                        }
-                        finally
-                        {
-                            trayIcon.Visible = mainTrayWasVisible;
-                            ShowInTaskbar = mainTaskbarWasVisible;
-                        }
+                        activeModeWindow = form;
+                        // Hide the legacy window BEFORE entering the modal
+                        // loop. The mode window is the only visible window and
+                        // tray owner; its live modal handle is never hidden.
+                        // Keep the owner's taskbar style unchanged so hiding it
+                        // does not recreate its handle or initialization path.
+                        Hide();
+                        trayIcon.Visible = false;
+                        form.ShowDialog(this);
                         dualRecoveryPending = form.HasOwnedState;
                         legacyRequested = form.RequestedLegacyMode && !dualRecoveryPending;
                         exitRequested = form.RequestedApplicationExit && !dualRecoveryPending;
@@ -3825,7 +3886,21 @@ namespace FastLinkDirectTool
                     catch { dualRecoveryPending = true; }
                     SafeLog("双网界面未能正常打开；旧模式仍暂停" + (dualRecoveryPending ? "，保留待恢复状态" : "，没有发现网络事务记录") + "：" + error.Message);
                 }
-                finally { busy = false; RefreshUi(); if (!exitRequested) monitorTimer.Start(); }
+                finally
+                {
+                    activeModeWindow = null;
+                    busy = false;
+                    RefreshUi();
+                    if (!exitRequested)
+                    {
+                        // Restore mode one only after the modal window and its
+                        // tray have been disposed (or startup failed). A verified
+                        // application exit must never flash the old window back.
+                        trayIcon.Visible = mainTrayWasVisible;
+                        ShowFromTray();
+                        monitorTimer.Start();
+                    }
+                }
                 if (exitRequested) ExitAndClean();
             }));
         }

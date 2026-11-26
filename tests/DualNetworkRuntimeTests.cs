@@ -142,6 +142,19 @@ namespace FastLinkDirectTool.Tests
         }
 
         private static void Test(string name, Action action) { action(); passed++; Console.WriteLine("PASS " + name); }
+        private static Fixture PreparedReadFixture()
+        {
+            Fixture f = new Fixture(); f.Request.CorporateCidrs.Add("10.0.0.0/8");
+            Assert(f.Runtime.Arm(f.Request, true).Success, "fixture arm failed");
+            f.Platform.Writes = f.Platform.Removes = f.Platform.Reads = 0;
+            f.Journal.Saves = f.Journal.Deletes = 0;
+            return f;
+        }
+        private static void AssertPreparedPreserved(Fixture f, string fingerprint)
+        {
+            AssertNoReconciliationEffects(f);
+            Assert(DualJournalFingerprint.Compute(f.Journal.Stored) == fingerprint, "Prepared journal or authentication routes changed.");
+        }
         private static Fixture StaleFixture(bool wasRunning)
         {
             Fixture f = new Fixture();
@@ -198,6 +211,94 @@ namespace FastLinkDirectTool.Tests
                     Assert(f.Platform.Writes == 1 && f.Dns.Starts == 0, "Waiting arm changed unavailable corporate/DNS.");
                     Assert(f.Runtime.Stop(true).Success, "Arm rollback failed."); f.AssertClean();
                 });
+                Test("prepared validation reads actual role metrics without changing journal or routes", delegate
+                {
+                    Fixture f = PreparedReadFixture(); string original = DualJournalFingerprint.Compute(f.Journal.Stored);
+                    DualOperationResult result = f.Runtime.ValidateCurrent();
+                    Assert(result.Success && f.Runtime.IsArmed && !f.Runtime.HasPending && f.Platform.Reads == 2, "Prepared metrics were not checked.");
+                    Assert(result.VerifiedPreparationSnapshot != null && !object.ReferenceEquals(result.VerifiedPreparationSnapshot, f.Platform.Snapshot) &&
+                        !object.ReferenceEquals(result.VerifiedPreparationSnapshot.Adapters[0], f.Platform.Snapshot.Adapters[0]), "Verified display snapshot was absent or shared mutable state.");
+                    AssertPreparedPreserved(f, original);
+                });
+                Test("prepared unplugged company adapter remains valid with the same GUID and metric", delegate
+                {
+                    Fixture f = PreparedReadFixture(); string original = DualJournalFingerprint.Compute(f.Journal.Stored);
+                    f.Platform.Snapshot.Adapters[0].IsUp = false; f.Platform.Snapshot.StableSeconds = 0;
+                    f.Platform.Snapshot.CorporateAdmissionVerified = f.Platform.Snapshot.InternetReachabilityVerified = false;
+                    Assert(f.Runtime.ValidateCurrent().Success && f.Runtime.IsArmed, "Unplugged same-GUID preparation was revoked.");
+                    AssertPreparedPreserved(f, original);
+                });
+                Test("prepared originally absent company adapter can still wait without inventing its metric", delegate
+                {
+                    Fixture f = new Fixture(); f.Platform.Snapshot.Adapters.RemoveAt(0);
+                    Assert(f.Runtime.Arm(f.Request, true).Success, "Waiting arm failed.");
+                    f.Platform.Writes = f.Platform.Removes = f.Platform.Reads = f.Journal.Saves = f.Journal.Deletes = 0;
+                    string original = DualJournalFingerprint.Compute(f.Journal.Stored);
+                    Assert(f.Runtime.ValidateCurrent().Success && f.Runtime.IsArmed && f.Platform.Reads == 1, "Absent corporate adapter was guessed or invalidated.");
+                    AssertPreparedPreserved(f, original);
+                });
+                foreach (string changed in new[] { Corp, Internet })
+                    Test("prepared metric drift pauses without cleanup or priority restoration " + changed, delegate
+                    {
+                        Fixture f = PreparedReadFixture(); string original = DualJournalFingerprint.Compute(f.Journal.Stored);
+                        string metric = Key(new DualResource { Kind = DualResourceKind.Metric4, InterfaceId = changed });
+                        f.Platform.Values[metric] = "automatic=1;metric=25";
+                        DualOperationResult result = f.Runtime.ValidateCurrent();
+                        Assert(!result.Success && result.Pending && result.State == "PreparedInvalidated" && !f.Runtime.IsArmed, "Drift retained prepared success.");
+                        Assert(f.Platform.Values[metric] == "automatic=1;metric=25", "External metric was overwritten.");
+                        if (changed == Corp) Assert(f.Platform.Values[Key(new DualResource { Kind = DualResourceKind.Metric4, InterfaceId = Internet })] == "automatic=0;metric=5", "Internet priority restored.");
+                        for (int i = 0; i < 3; i++) Assert(f.Runtime.ValidateCurrent().State == "PreparedInvalidated", "Pending cause disappeared.");
+                        Assert(f.Runtime.Stop(false).State == "EgressConfirmationRequired", "Explicit default restore no longer requires approval.");
+                        AssertPreparedPreserved(f, original);
+                    });
+                foreach (bool replace in new[] { false, true })
+                    Test("prepared company GUID loss or replacement is not a read timeout replace=" + replace, delegate
+                    {
+                        Fixture f = PreparedReadFixture(); string original = DualJournalFingerprint.Compute(f.Journal.Stored);
+                        if (replace) f.Platform.Snapshot.Adapters[0].Id = "33333333-3333-3333-3333-333333333333";
+                        else f.Platform.Snapshot.Adapters.RemoveAt(0);
+                        Assert(f.Runtime.ValidateCurrent().State == "PreparedInvalidated" && !f.Runtime.LastFailure.Deferred, "Missing GUID deferred or substituted by name.");
+                        AssertPreparedPreserved(f, original);
+                    });
+                Test("prepared unowned preexisting correct metric is still checked by GUID", delegate
+                {
+                    Fixture f = new Fixture();
+                    f.Platform.Values[Key(new DualResource { Kind = DualResourceKind.Metric4, InterfaceId = Corp })] = "automatic=0;metric=55";
+                    Assert(f.Runtime.Arm(f.Request, true).Success, "Preexisting metric arm failed.");
+                    f.Platform.Writes = f.Platform.Removes = f.Journal.Saves = f.Journal.Deletes = 0;
+                    string original = DualJournalFingerprint.Compute(f.Journal.Stored); f.Platform.Snapshot.Adapters.RemoveAt(0);
+                    Assert(f.Runtime.ValidateCurrent().State == "PreparedInvalidated", "GUID without owned metric was not checked.");
+                    AssertPreparedPreserved(f, original);
+                });
+                Test("prepared unknown read failure invalidates without cleanup", delegate
+                {
+                    Fixture f = PreparedReadFixture(); string original = DualJournalFingerprint.Compute(f.Journal.Stored); f.Platform.FailRead = true;
+                    Assert(f.Runtime.ValidateCurrent().State == "PreparedInvalidated" && !f.Runtime.LastFailure.Deferred, "Unknown read was successful or deferred.");
+                    AssertPreparedPreserved(f, original);
+                });
+                Test("prepared confirmed read timeout has cooldown and requires a successful metric retry", delegate
+                {
+                    Fixture f = PreparedReadFixture(); string original = DualJournalFingerprint.Compute(f.Journal.Stored); int attempts = 0;
+                    f.Platform.BeforeRead = delegate { if (++attempts == 1) throw new DualReadUnavailableException("worker_timeout:response"); };
+                    DualOperationResult result = f.Runtime.ValidateCurrent();
+                    Assert(!result.Success && result.State == "ReadDeferred" && f.Runtime.IsArmed, "Read timeout claimed preparation success.");
+                    int captures = f.Platform.Captures;
+                    Assert(!f.Runtime.ValidateCurrent().Success && f.Platform.Captures == captures && attempts == 1, "Cooldown retried IO or claimed success.");
+                    f.Now = f.Now.AddSeconds(5);
+                    Assert(f.Runtime.ValidateCurrent().Success && f.Runtime.LastFailure == null && attempts == 3, "Metrics were not actually rechecked.");
+                    AssertPreparedPreserved(f, original);
+                });
+                foreach (bool expire in new[] { false, true })
+                    Test("prepared typed read failure is bounded without automatic rollback expire=" + expire, delegate
+                    {
+                        Fixture f = PreparedReadFixture(); string original = DualJournalFingerprint.Compute(f.Journal.Stored);
+                        f.Platform.CaptureOverride = delegate { throw new DualReadUnavailableException("worker_timeout:response"); };
+                        Assert(f.Runtime.ValidateCurrent().State == "ReadDeferred", "First timeout not deferred.");
+                        if (!expire) { f.Now = f.Now.AddSeconds(5); Assert(f.Runtime.ValidateCurrent().State == "ReadDeferred", "Second timeout not deferred."); }
+                        f.Now = f.Now.AddSeconds(expire ? 31 : 5);
+                        Assert(f.Runtime.ValidateCurrent().State == "PreparedInvalidated" && !f.Runtime.IsArmed, "Uncertainty budget was extended indefinitely.");
+                        AssertPreparedPreserved(f, original);
+                    });
                 Test("IPv6 default is rejected even when preview safety boolean is true", delegate
                 {
                     Fixture f = new Fixture(); f.Platform.Snapshot.Adapters[1].HasIpv6Default = true; f.Platform.Snapshot.Ipv6SafetyVerified = true;
@@ -449,6 +550,36 @@ namespace FastLinkDirectTool.Tests
                     finally { release.Set(); Assert(checker.Join(5000), "Capture worker did not finish."); entered.Dispose(); release.Dispose(); }
                     Assert(checkedResult != null && checkedResult.Success && f.Runtime.IsActive && !f.Runtime.HasPending && f.Dns.Running, "Stale capture failure affected new generation.");
                 });
+                Test("DNS rollback cause survives a concurrently completing older validation", delegate
+                {
+                    Fixture f = new Fixture(); f.Request.CorporateCidrs.Add("10.0.0.0/8"); f.Start();
+                    Assert(f.Dns.Callback(f.Dns.Generation, RuleTarget.Corporate, new[]{"10.66.16.104"}), "Covered route fixture failed.");
+                    DualResource covering = f.Journal.Stored.Entries.First(e => e.Resource.Kind == DualResourceKind.Route4 && e.Resource.Destination == "10.0.0.0/8").Resource;
+                    f.Now = f.Now.AddSeconds(61);
+                    using(ManualResetEvent entered = new ManualResetEvent(false))
+                    using(ManualResetEvent release = new ManualResetEvent(false))
+                    {
+                        int first = 0;
+                        f.Platform.CaptureOverride = delegate
+                        {
+                            if(Interlocked.CompareExchange(ref first, 1, 0) == 0)
+                            { entered.Set(); if(!release.WaitOne(5000))throw new Exception("fixture capture wait"); }
+                            return f.Platform.Snapshot;
+                        };
+                        DualOperationResult result = null;
+                        Thread checker = new Thread(delegate(){result=f.Runtime.ValidateCurrent();});checker.Start();
+                        try
+                        {
+                            Assert(entered.WaitOne(2000), "Concurrent validation did not enter Capture.");
+                            f.Platform.Values.Remove(Key(covering));
+                            Assert(!f.Dns.Callback(f.Dns.Generation, RuleTarget.Corporate, new[]{"10.66.16.104"}), "Deleted covering route was accepted.");
+                            f.AssertProtected();
+                        }
+                        finally{release.Set();Assert(checker.Join(5000),"Concurrent validation did not finish.");}
+                        Assert(result!=null&&!result.Success&&result.Pending&&result.State=="InternetProtected", "Background failure state was lost.");
+                        Assert(result.Message.Contains("已确认的路由已被删除或修改"), "The original DNS rollback cause was replaced by a stale-generation message.");
+                    }
+                });
                 Test("late invalid Capture result after Stop does not resurrect or clean twice", delegate
                 {
                     Fixture f = new Fixture(); f.Start(); ManualResetEvent entered = new ManualResetEvent(false), release = new ManualResetEvent(false);
@@ -459,6 +590,106 @@ namespace FastLinkDirectTool.Tests
                     { Assert(entered.WaitOne(2000), "Capture not entered."); Assert(f.Runtime.Stop(true).Success, "Stop failed."); writes = f.Platform.Writes; removes = f.Platform.Removes; }
                     finally { release.Set(); Assert(checker.Join(5000), "Capture worker did not finish."); entered.Dispose(); release.Dispose(); }
                     Assert(checkedResult != null && checkedResult.Success && f.Platform.Writes == writes && f.Platform.Removes == removes, "Late result changed stopped session."); f.AssertClean();
+                });
+                Test("confirmed read-only timeout rejects one DNS answer without rolling back and retry recovers", delegate
+                {
+                    Fixture f=new Fixture();f.Start();int captures=0;
+                    f.Platform.CaptureOverride=delegate{if(++captures==1)throw new DualReadUnavailableException("worker_timeout:response");return f.Platform.Snapshot;};
+                    int writes=f.Platform.Writes,removes=f.Platform.Removes,entries=f.Journal.Stored.Entries.Count,saves=f.Journal.Saves;
+                    long epoch=f.Runtime.Generation;
+                    Assert(!f.Dns.Callback(epoch,RuleTarget.Corporate,new[]{"192.0.2.90"}),"Unverified DNS answer escaped.");
+                    Assert(f.Runtime.IsActive&&!f.Runtime.HasPending&&f.Dns.Running&&f.Runtime.Generation==epoch&&f.Platform.Writes==writes&&f.Platform.Removes==removes&&f.Journal.Saves==saves&&f.Journal.Stored.Entries.Count==entries,"Read-only failure mutated the session.");
+                    DualRuntimeFailure failure=f.Runtime.LastFailure;
+                    Assert(failure!=null&&failure.Deferred&&failure.Stage=="dns_capture"&&!object.ReferenceEquals(failure,f.Runtime.LastFailure),"Failure context missing or not copied.");
+                    Assert(!f.Dns.Callback(epoch,RuleTarget.Corporate,new[]{"192.0.2.90"})&&captures==1,"Read cooldown retried too early.");
+                    f.Now=f.Now.AddSeconds(5);
+                    Assert(f.Dns.Callback(epoch,RuleTarget.Corporate,new[]{"192.0.2.90"})&&f.Runtime.LastFailure==null&&f.Runtime.IsActive,"Successful real retry did not clear warning.");
+                });
+                Test("cached-route read timeout retains route but changed ownership on retry remains fatal", delegate
+                {
+                    Fixture f=new Fixture();f.Start();Assert(f.Dns.Callback(f.Dns.Generation,RuleTarget.Corporate,new[]{"192.0.2.90"}),"Initial DNS route failed.");f.Now=f.Now.AddSeconds(61);
+                    int writes=f.Platform.Writes,removes=f.Platform.Removes;
+                    f.Platform.BeforeRead=delegate{f.Platform.BeforeRead=null;throw new DualReadUnavailableException("worker_timeout:response");};
+                    Assert(!f.Dns.Callback(f.Dns.Generation,RuleTarget.Corporate,new[]{"192.0.2.90"})&&f.Runtime.IsActive&&f.Platform.Writes==writes&&f.Platform.Removes==removes,"Transient read tore down cached routes.");
+                    DualResource route=f.Journal.Stored.Entries.First(e=>e.Resource.Destination=="192.0.2.90/32").Resource;
+                    f.Platform.Values.Remove(Key(route));f.Now=f.Now.AddSeconds(5);
+                    Assert(!f.Dns.Callback(f.Dns.Generation,RuleTarget.Corporate,new[]{"192.0.2.90"}),"Deleted route was accepted on retry.");f.AssertProtected();
+                    Assert(f.Runtime.LastFailure.Code=="route_readback_changed"&&!f.Runtime.LastFailure.Deferred,"Ownership mismatch was softened.");
+                });
+                Test("periodic validation has read-only bounded backoff and resumes only after actual capture", delegate
+                {
+                    Fixture f=new Fixture();f.Start();int attempts=0;
+                    f.Platform.CaptureOverride=delegate{if(++attempts==1)throw new DualReadUnavailableException("worker_timeout:startup");return f.Platform.Snapshot;};
+                    int writes=f.Platform.Writes,removes=f.Platform.Removes;
+                    DualOperationResult deferred=f.Runtime.ValidateCurrent();
+                    Assert(!deferred.Success&&!deferred.Pending&&deferred.State=="ReadDeferred"&&f.Runtime.IsActive,"Validation claimed success or stopped on one confirmed timeout.");
+                    Assert(f.Runtime.ValidateCurrent().State=="ReadDeferred"&&attempts==1&&f.Platform.Writes==writes&&f.Platform.Removes==removes,"Cooldown did IO or changed routes.");
+                    f.Now=f.Now.AddSeconds(5);Assert(f.Runtime.ValidateCurrent().Success&&f.Runtime.LastFailure==null&&attempts==2,"Successful capture did not restore validation.");
+                });
+                Test("third consecutive confirmed read timeout falls back to protected cleanup", delegate
+                {
+                    Fixture f=new Fixture();f.Start();int attempts=0;
+                    f.Platform.CaptureOverride=delegate{if(++attempts<=3)throw new DualReadUnavailableException("worker_timeout:response");return f.Platform.Snapshot;};
+                    for(int i=0;i<2;i++){Assert(f.Runtime.ValidateCurrent().State=="ReadDeferred"&&f.Runtime.IsActive,"Early timeout was not deferred.");f.Now=f.Now.AddSeconds(5);}
+                    DualOperationResult fatal=f.Runtime.ValidateCurrent();Assert(!fatal.Success&&fatal.Pending,"Unbounded read failures retained active DNS.");f.AssertProtected();
+                });
+                Test("read deferral has a total-time limit and cannot be extended by fresh cached answers", delegate
+                {
+                    Fixture f=new Fixture();f.Start();Assert(f.Dns.Callback(f.Dns.Generation,RuleTarget.Corporate,new[]{"192.0.2.90"}),"Cache fixture failed.");int attempts=0;
+                    f.Platform.CaptureOverride=delegate{if(++attempts==1)throw new DualReadUnavailableException("worker_timeout:response");return f.Platform.Snapshot;};
+                    Assert(f.Runtime.ValidateCurrent().State=="ReadDeferred","Missing timeout warning.");
+                    Assert(f.Dns.Callback(f.Dns.Generation,RuleTarget.Corporate,new[]{"192.0.2.90"})&&f.Runtime.LastFailure!=null,"Cache hit falsely renewed verification.");
+                    f.Now=f.Now.AddSeconds(31);Assert(!f.Runtime.ValidateCurrent().Success,"Expired uncertainty retained active service.");f.AssertProtected();
+                });
+                Test("unknown CIM error remains fatal and pending diagnostics never reexecute network operations", delegate
+                {
+                    Fixture f=new Fixture();f.Start();int attempts=0;
+                    f.Platform.CaptureOverride=delegate{if(++attempts==1)throw new InvalidOperationException("fixture [worker_command:CimException]");return f.Platform.Snapshot;};
+                    Assert(!f.Dns.Callback(f.Dns.Generation,RuleTarget.Corporate,new[]{"192.0.2.90"}),"Unknown failure escaped.");f.AssertProtected();
+                    int captures=f.Platform.Captures,reads=f.Platform.Reads,writes=f.Platform.Writes,removes=f.Platform.Removes;
+                    for(int i=0;i<5;i++)Assert(f.Runtime.ValidateCurrent().Message.Contains("worker_command:CimException"),"Pending cause disappeared.");
+                    Assert(f.Platform.Captures==captures&&f.Platform.Reads==reads&&f.Platform.Writes==writes&&f.Platform.Removes==removes,"Reading pending status performed network operations.");
+                });
+                Test("unrelated expired cache read cannot reset another DNS operation timeout budget", delegate
+                {
+                    Fixture f=new Fixture();f.Start();
+                    Assert(f.Dns.Callback(f.Dns.Generation,RuleTarget.Corporate,new[]{"192.0.2.90"})&&f.Dns.Callback(f.Dns.Generation,RuleTarget.Corporate,new[]{"192.0.2.91"}),"Cache fixtures failed.");
+                    f.Now=f.Now.AddSeconds(61);f.Platform.BeforeRead=delegate{f.Platform.BeforeRead=null;throw new DualReadUnavailableException("worker_timeout:response");};
+                    Assert(!f.Dns.Callback(f.Dns.Generation,RuleTarget.Corporate,new[]{"192.0.2.90"}),"Unverified cached answer escaped.");
+                    f.Now=f.Now.AddSeconds(5);
+                    Assert(f.Dns.Callback(f.Dns.Generation,RuleTarget.Corporate,new[]{"192.0.2.91"})&&f.Runtime.LastFailure!=null,"Unrelated real read cleared the pending operation warning.");
+                    Assert(f.Runtime.ValidateCurrent().State=="ReadDeferred","Unrelated topology success cleared outstanding DNS read uncertainty.");
+                    f.Now=f.Now.AddSeconds(26);Assert(!f.Runtime.ValidateCurrent().Success,"Other cache traffic extended the total uncertainty budget.");f.AssertProtected();
+                });
+                Test("successful retry clears only its own failure when two DNS operations are unverified", delegate
+                {
+                    Fixture f=new Fixture();f.Start();int failures=0;
+                    f.Platform.CaptureOverride=delegate{if(++failures<=2)throw new DualReadUnavailableException("worker_timeout:response");return f.Platform.Snapshot;};
+                    Assert(!f.Dns.Callback(f.Dns.Generation,RuleTarget.Corporate,new[]{"192.0.2.90"}),"First timeout escaped.");f.Now=f.Now.AddSeconds(5);
+                    Assert(!f.Dns.Callback(f.Dns.Generation,RuleTarget.Corporate,new[]{"192.0.2.91"}),"Second timeout escaped.");f.Now=f.Now.AddSeconds(5);
+                    Assert(f.Dns.Callback(f.Dns.Generation,RuleTarget.Corporate,new[]{"192.0.2.90"})&&f.Runtime.LastFailure!=null,"One retry cleared another outstanding timeout.");
+                    Assert(f.Dns.Callback(f.Dns.Generation,RuleTarget.Corporate,new[]{"192.0.2.91"})&&f.Runtime.LastFailure==null,"Both recovered operations did not clear warning.");
+                });
+                Test("periodic route-read timeout retries the same audit before clearing deferred verification", delegate
+                {
+                    Fixture f=new Fixture();f.Start();for(int i=0;i<5;i++)Assert(f.Runtime.ValidateCurrent().Success,"Initial validation failed.");
+                    f.Platform.BeforeRead=delegate{f.Platform.BeforeRead=null;throw new DualReadUnavailableException("worker_timeout:response");};
+                    Assert(f.Runtime.ValidateCurrent().State=="ReadDeferred","Audit timeout was not deferred.");int reads=f.Platform.Reads;
+                    f.Now=f.Now.AddSeconds(5);Assert(f.Runtime.ValidateCurrent().Success&&f.Platform.Reads==reads+1&&f.Runtime.LastFailure==null,"Retry skipped the still-unverified route audit.");
+                });
+                Test("read timeout after new write-ahead entry is not treated as harmless read-only failure", delegate
+                {
+                    Fixture f=new Fixture();f.Start();int reads=0;
+                    f.Platform.BeforeRead=delegate{if(++reads==2){f.Platform.BeforeRead=null;throw new DualReadUnavailableException("worker_timeout:response");}};
+                    Assert(!f.Dns.Callback(f.Dns.Generation,RuleTarget.Corporate,new[]{"192.0.2.90"}),"Uncertain write-ahead was accepted.");f.AssertProtected();
+                    Assert(!f.Runtime.LastFailure.Deferred,"Write-ahead uncertainty was softened.");
+                });
+                Test("typed read timeout after a network write cannot preserve an uncertain partial update", delegate
+                {
+                    Fixture f=new Fixture();f.Start();
+                    f.Platform.BeforeWrite=delegate{f.Platform.BeforeWrite=null;f.Platform.BeforeRead=delegate{f.Platform.BeforeRead=null;throw new DualReadUnavailableException("worker_timeout:response");};};
+                    Assert(!f.Dns.Callback(f.Dns.Generation,RuleTarget.Corporate,new[]{"192.0.2.90"}),"Unverified written route was accepted.");f.AssertProtected();
+                    Assert(!f.Runtime.LastFailure.Deferred,"Post-write uncertainty was softened.");
                 });
                 Test("crash journal startup gate reads only and Stop auto-loads own scope", delegate
                 {

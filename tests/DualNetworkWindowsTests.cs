@@ -131,6 +131,55 @@ namespace FastLinkDirectTool.Tests
                     Assert(!f.Platform.Capture().InternetReachabilityVerified, "uncertain interval revived proof");
                 }
             });
+            Test("confirmed recycled-worker read timeouts preserve proof until next real snapshot", delegate
+            {
+                foreach(string code in new[]{"worker_timeout:startup","worker_timeout:send","worker_timeout:response"})
+                {
+                    Fake f=new Fake();f.Capture();f.Platform.ConfirmInternetForCurrentTopology();f.Capture();
+                    f.Results.Enqueue(new DualCommandResult{ExitCode=-1,TimedOut=true,ErrorCode=code});
+                    bool typed=false;try{f.Platform.Capture();}catch(DualReadUnavailableException error){typed=error.Code==code;}
+                    Assert(typed,"Confirmed read timeout lost typed evidence.");
+                    f.Results.Enqueue(CaptureJson(10,"192.0.2.20",false,false));
+                    Assert(f.Platform.Capture().InternetReachabilityVerified,"Known read-only timeout destroyed unchanged consumed proof.");
+                }
+            });
+            Test("preserved proof after confirmed read timeout still rejects changed topology", delegate
+            {
+                Fake f=new Fake();f.Capture();f.Platform.ConfirmInternetForCurrentTopology();f.Capture();
+                f.Results.Enqueue(new DualCommandResult{ExitCode=-1,TimedOut=true,ErrorCode="worker_timeout:response"});Throws(delegate{f.Platform.Capture();});
+                f.Results.Enqueue(CaptureJson(11,"192.0.2.21",false,false));Assert(!f.Platform.Capture().InternetReachabilityVerified,"Topology change retained timeout proof.");
+                f.Results.Enqueue(CaptureJson(10,"192.0.2.20",false,false));Assert(!f.Platform.Capture().InternetReachabilityVerified,"Former topology revived invalidated proof.");
+            });
+            Test("unconfirmed timeout and generic CIM failures are never classified as transient reads", delegate
+            {
+                foreach(DualCommandResult result in new[]{
+                    new DualCommandResult{TimedOut=true},
+                    new DualCommandResult{ExitCode=-1,TimedOut=true,ErrorCode="worker_cleanup_pending"},
+                    new DualCommandResult{ExitCode=-1,TimedOut=true,ErrorCode="worker_timeout:unknown"},
+                    new DualCommandResult{ExitCode=1,TimedOut=false,ErrorCode="worker_command:CimException"}})
+                {
+                    Fake f=new Fake();f.Capture();f.Platform.ConfirmInternetForCurrentTopology();f.Capture();f.Results.Enqueue(result);
+                    bool thrown=false;try{f.Platform.Capture();}catch(Exception error){thrown=true;Assert(!(error is DualReadUnavailableException),"Unconfirmed failure softened.");}
+                    Assert(thrown,"Failure accepted.");f.Results.Enqueue(CaptureJson(10,"192.0.2.20",false,false));
+                    Assert(!f.Platform.Capture().InternetReachabilityVerified,"Unsafe failure retained proof.");
+                }
+            });
+            Test("resource read exposes confirmed timeout but writes never do", delegate
+            {
+                Fake f=new Fake();f.Capture();
+                f.Results.Enqueue(new DualCommandResult{ExitCode=-1,TimedOut=true,ErrorCode="worker_timeout:response"});
+                bool typed=false;try{f.Platform.Read(Metric());}catch(DualReadUnavailableException){typed=true;}Assert(typed,"Read timeout not typed.");
+                f.Results.Enqueue(Value("automatic=1;metric=25"));f.Platform.Read(Metric());
+                f.Results.Enqueue(new DualCommandResult{ExitCode=-1,TimedOut=true,ErrorCode="worker_timeout:response"});
+                bool thrown=false;try{f.Platform.Write(Metric(),"automatic=0;metric=55");}catch(Exception error){thrown=true;Assert(!(error is DualReadUnavailableException),"Write timeout incorrectly softened.");}Assert(thrown,"Write timeout ignored.");
+            });
+            Test("remove timeout remains uncertain mutation even when worker exit was confirmed", delegate
+            {
+                Fake f=new Fake();f.Capture();DualResource r=Route("192.0.2.1","10.20.30.40/32");
+                f.Results.Enqueue(Value("metric=1"));f.Platform.Read(r);
+                f.Results.Enqueue(new DualCommandResult{ExitCode=-1,TimedOut=true,ErrorCode="worker_timeout:response"});
+                bool thrown=false;try{f.Platform.Remove(r);}catch(Exception error){thrown=true;Assert(!(error is DualReadUnavailableException),"Remove timeout incorrectly softened.");}Assert(thrown,"Remove timeout ignored.");
+            });
             Test("clock reversal invalidates consumed proof without periodic probes", delegate
             {
                 Fake f = new Fake(); f.Capture(); f.Platform.ConfirmInternetForCurrentTopology(); f.Capture();

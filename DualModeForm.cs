@@ -37,10 +37,21 @@ namespace FastLinkDirectTool.Modes
         private readonly bool offlinePreview;
         private readonly bool injectedPreviewSession;
         private readonly Func<bool> previewStopApproval;
+        private readonly Func<bool> previewPermissionApproval;
+        private readonly bool previewExplicitIntent;
         private readonly Label modeNotice = new Label();
-        private readonly Button checkAction, saveAction, prepareAction, enableAction, stopAction, archiveAction, exitAction;
+        private readonly Label connectionSummary = new Label();
+        private readonly Label ruleHint = new Label();
+        private readonly Label operationStatus = new Label();
+        private readonly Panel settingsPanel = new Panel();
+        private readonly TableLayoutPanel rootLayout = new TableLayoutPanel();
+        private readonly Button settingsAction = new Button();
+        private bool settingsExpanded;
+        private DateTime workingSinceUtc;
+        private readonly Button checkAction, saveAction, prepareAction, enableAction, stopAction, archiveAction, exitAction, addRuleAction, deleteRuleAction;
         private DualModeProfile profile;
         private bool working, closing, allowClose, closeQueued, automaticChecksPaused;
+        private bool preparedVerificationPending;
         private bool updatingChoices;
         private string confirmedTopology;
         private string lastMessage;
@@ -53,7 +64,7 @@ namespace FastLinkDirectTool.Modes
         public bool RequestedApplicationExit { get; private set; }
         private bool LegacySelected { get { return mode.SelectedIndex == 0; } }
 
-        internal DualModeForm(IEnumerable<string> sourceRules, Action<string> logger, bool previewOnly = false, IDualModeUiSession previewSession = null, Func<bool> previewStopApproval = null, bool prepareOnOpen = false)
+        internal DualModeForm(IEnumerable<string> sourceRules, Action<string> logger, bool previewOnly = false, IDualModeUiSession previewSession = null, Func<bool> previewStopApproval = null, bool prepareOnOpen = false, Func<bool> previewPermissionApproval = null, bool previewExplicitIntent = false)
         {
             // Keep this modal window's taskbar style fixed before creating its
             // handle. Changing ShowInTaskbar while ShowDialog is running can
@@ -62,9 +73,12 @@ namespace FastLinkDirectTool.Modes
             ShowInTaskbar = false;
             if (previewSession != null && !previewOnly) throw new ArgumentException("Session injection is only supported by offline UI tests.");
             if (previewStopApproval != null && !previewOnly) throw new ArgumentException("Approval injection is only supported by offline UI tests.");
+            if ((previewPermissionApproval != null || previewExplicitIntent) && (!previewOnly || previewSession == null)) throw new ArgumentException("Explicit intent injection requires an offline fake session.");
             offlinePreview = previewOnly;
             injectedPreviewSession = previewSession != null;
             this.previewStopApproval = previewStopApproval;
+            this.previewPermissionApproval = previewPermissionApproval;
+            this.previewExplicitIntent = previewExplicitIntent;
             log = logger ?? delegate { };
             profile = offlinePreview ? new DualModeProfile { Rules = DualRuleMigration.Propose(sourceRules) } : DualProfileStore.Load(sourceRules);
             platform = offlinePreview ? new DualNetworkWindowsPlatform(delegate { throw new InvalidOperationException("Offline UI cannot execute commands."); },
@@ -73,68 +87,107 @@ namespace FastLinkDirectTool.Modes
                 (IDualModeUiSession)new RuntimeSession(new DualNetworkRuntime(platform, new DualFileJournal(), new DualNetworkDns()));
             Text = "直连助手 · 网络模式";
             Font = new Font("Microsoft YaHei UI", 9F);
-            Size = new Size(1080, 880); MinimumSize = new Size(980, 810);
+            Size = new Size(940, 640); MinimumSize = new Size(860, 600);
             StartPosition = FormStartPosition.CenterParent;
-            TableLayoutPanel root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(14), ColumnCount = 1, RowCount = 8 };
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 62));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 92));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 72));
-            root.RowStyles.Add(new RowStyle(SizeType.Percent, 48));
+            TableLayoutPanel root = rootLayout;
+            root.Dock = DockStyle.Fill; root.Padding = new Padding(14); root.ColumnCount = 1; root.RowCount = 9;
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 66));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
-            root.RowStyles.Add(new RowStyle(SizeType.Percent, 52));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 0));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
             Controls.Add(root);
             modeNotice.Dock = DockStyle.Fill; modeNotice.Padding = new Padding(8); modeNotice.BackColor = Color.FromArgb(255, 244, 214);
             root.Controls.Add(modeNotice, 0, 0);
-            TableLayoutPanel roles = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 3 };
+            TableLayoutPanel modeRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1 };
+            modeRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110)); modeRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            TableLayoutPanel roles = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 2 };
             roles.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110)); roles.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             mode.DropDownStyle = corporate.DropDownStyle = internet.DropDownStyle = ComboBoxStyle.DropDownList;
             mode.Dock = corporate.Dock = internet.Dock = DockStyle.Fill;
             mode.Items.AddRange(new object[] { "模式一：FastLink 代理 + 指定目标直连", "模式二：有线公司内网 + Wi-Fi 外网", "模式三：Wi-Fi 公司内网 + 有线外网" });
             mode.SelectedIndex = profile.Mode == WorkMode.WifiCorporateWiredInternet ? 2 : 1;
-            roles.Controls.Add(new Label { Text = "工作模式", AutoSize = true }, 0, 0); roles.Controls.Add(mode, 1, 0);
-            roles.Controls.Add(new Label { Text = "公司接口", AutoSize = true }, 0, 1); roles.Controls.Add(corporate, 1, 1);
-            roles.Controls.Add(new Label { Text = "互联网接口", AutoSize = true }, 0, 2); roles.Controls.Add(internet, 1, 2);
-            root.Controls.Add(roles, 0, 1);
+            modeRow.Controls.Add(new Label { Text = "工作模式", AutoSize = true }, 0, 0); modeRow.Controls.Add(mode, 1, 0);
+            roles.Controls.Add(new Label { Text = "公司接口", AutoSize = true }, 0, 0); roles.Controls.Add(corporate, 1, 0);
+            roles.Controls.Add(new Label { Text = "互联网接口", AutoSize = true }, 0, 1); roles.Controls.Add(internet, 1, 1);
+            root.Controls.Add(modeRow, 0, 1);
+            connectionSummary.Dock = DockStyle.Fill; connectionSummary.Padding = new Padding(3, 5, 0, 0);
+            root.Controls.Add(connectionSummary, 0, 2);
+            settingsPanel.Dock = DockStyle.Fill; settingsPanel.Visible = false;
+            var tabs = new TabControl { Dock = DockStyle.Fill };
+            TabPage interfacesPage = new TabPage("接口设置"), logPage = new TabPage("运行日志");
+            tabs.TabPages.Add(interfacesPage); tabs.TabPages.Add(logPage); settingsPanel.Controls.Add(tabs);
+            var settingsLayout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(5) };
+            settingsLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 64));
+            settingsLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+            settingsLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+            interfacesPage.Controls.Add(settingsLayout); settingsLayout.Controls.Add(roles, 0, 0);
+            root.Controls.Add(settingsPanel, 0, 6);
             foreach (ComboBox selector in new[] { corporate, internet })
                 selector.SelectedIndexChanged += delegate { if (!updatingChoices) ResetNetworkConfirmations(); };
-            FlowLayoutPanel checks = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = true };
+            // Kept as private state for the existing runtime gate and fake tests;
+            // daily use has no checklist. Explicit Start/Save actions provide the
+            // current user intent; live Internet verification stays automatic.
+            FlowLayoutPanel checks = new FlowLayoutPanel { Visible = false, Width = 1, Height = 1 };
             permitted.Text = "已确认公司允许这台电脑双网并用（记住本机）";
             permitted.Checked = profile.IsPermissionConfirmed(platform.ScopeIdentity, profile.CorporateAdapterId, profile.InternetAdapterId);
             externalOk.Text = "外网连通性：操作时自动检测";
             admission.Text = "公司接口已通过 MOKA 准入（接线后确认）";
             confirmed.Text = "已确认下方规则的内外网分类"; confirmed.Checked = profile.RulesConfirmed;
             foreach (CheckBox box in new[] { permitted, externalOk, admission, confirmed }) { box.AutoSize = true; box.Margin = new Padding(6, 6, 12, 4); checks.Controls.Add(box); }
-            root.Controls.Add(checks, 0, 2);
+            Controls.Add(checks);
             rules.Dock = DockStyle.Fill; rules.BackgroundColor = Color.White;
             rules.RowHeadersVisible = false; rules.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
-            rules.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "域名 / IP（原助手列表保持不变）", FillWeight = 72 });
+            rules.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+            rules.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "域名 / IP（双网规则）", FillWeight = 72 });
             DataGridViewComboBoxColumn target = new DataGridViewComboBoxColumn { HeaderText = "目标网络", FillWeight = 28 };
             target.Items.AddRange("公司内网", "互联网", "待确认"); rules.Columns.Add(target);
             foreach (ModeRule rule in profile.Rules) rules.Rows.Add(rule.Pattern, TargetText(rule.Target));
             rules.DefaultValuesNeeded += delegate(object s, DataGridViewRowEventArgs e) { e.Row.Cells[1].Value = "待确认"; };
             rules.CellValueChanged += delegate { confirmed.Checked = false; };
             rules.UserDeletedRow += delegate { confirmed.Checked = false; };
-            root.Controls.Add(rules, 0, 3);
+            root.Controls.Add(rules, 0, 4);
             FlowLayoutPanel ranges = new FlowLayoutPanel { Dock = DockStyle.Fill };
             ranges.Controls.Add(new Label { Text = "额外公司网段（可空，用逗号分隔）", AutoSize = true, Margin = new Padding(3, 8, 4, 0) });
             cidrs.Width = 430; cidrs.Text = string.Join(",", profile.CorporateCidrs.ToArray()); ranges.Controls.Add(cidrs);
             cidrs.TextChanged += delegate { confirmed.Checked = false; };
-            root.Controls.Add(ranges, 0, 4);
+            settingsLayout.Controls.Add(ranges, 0, 1);
             actions.Dock = DockStyle.Fill;
             checkAction = AddAction("检查状态", delegate { automaticChecksPaused = false; RefreshReadOnly(); });
-            saveAction = AddAction("保存分类", SaveProfile);
+            saveAction = AddAction("保存规则", SaveProfile);
             prepareAction = AddAction("准备公司与外网", delegate { Change(false); });
             enableAction = AddAction("启用双网分流", delegate { if (LegacySelected) RequestLegacyHandoff(); else Change(true); });
             stopAction = AddAction("停用 / 恢复清理", Stop);
             archiveAction = AddAction("核对旧会话记录", ReviewOldSession);
             exitAction = AddAction("退出助手", delegate { RequestSafeClose(false); });
             exitAction.BackColor = Color.FromArgb(180, 45, 45); exitAction.ForeColor = Color.White;
+            addRuleAction = AddAction("新增规则", AddRule);
+            deleteRuleAction = AddAction("删除所选", DeleteSelectedRules);
+            TableLayoutPanel ruleTools = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 1 };
+            ruleTools.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 86));
+            ruleTools.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 94));
+            ruleTools.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            ruleTools.Controls.Add(addRuleAction, 0, 0); ruleTools.Controls.Add(deleteRuleAction, 1, 0);
+            ruleHint.Dock = DockStyle.Fill; ruleHint.Padding = new Padding(10, 8, 0, 0);
+            ruleTools.Controls.Add(ruleHint, 2, 0); root.Controls.Add(ruleTools, 0, 3);
+            settingsAction.Text = "设置与日志"; settingsAction.AutoSize = true; settingsAction.Height = 32; settingsAction.Margin = new Padding(12, 6, 5, 0);
+            settingsAction.Click += delegate { ToggleSettings(); }; actions.Controls.Add(settingsAction);
+            var advancedActions = new FlowLayoutPanel { Dock = DockStyle.Fill };
+            foreach (Button button in new[] { checkAction, prepareAction, archiveAction, exitAction }) advancedActions.Controls.Add(button);
+            settingsLayout.Controls.Add(advancedActions, 0, 2);
+            actions.Controls.SetChildIndex(enableAction, 0); actions.Controls.SetChildIndex(stopAction, 1); actions.Controls.SetChildIndex(saveAction, 2);
             root.Controls.Add(actions, 0, 5);
             details.Dock = DockStyle.Fill; details.Multiline = true; details.ReadOnly = true; details.ScrollBars = ScrollBars.Vertical;
-            root.Controls.Add(details, 0, 6);
-            root.Controls.Add(new Label { Dock = DockStyle.Fill, Text = "点右上角“－”收起到托盘，分流继续；双击托盘图标恢复。“退出助手”或“×”才会安全清理退出。", Padding = new Padding(0, 5, 0, 0) }, 0, 7);
+            logPage.Controls.Add(details);
+            operationStatus.Dock = DockStyle.Fill; operationStatus.AutoEllipsis = true;
+            operationStatus.Padding = new Padding(0, 4, 0, 0); operationStatus.ForeColor = Color.DarkBlue;
+            operationStatus.Text = "最近操作：尚无；详细结果可在运行日志中查看。";
+            root.Controls.Add(operationStatus, 0, 7);
+            root.Controls.Add(new Label { Dock = DockStyle.Fill, Text = "× / 最小化仅收起，分流继续。再次打开桌面“直连助手”即可显示；真正退出请用托盘或设置中的“退出助手”。", Padding = new Padding(0, 5, 0, 0) }, 0, 8);
             mode.SelectedIndexChanged += delegate
             {
                 if (updatingChoices) return;
@@ -159,7 +212,7 @@ namespace FastLinkDirectTool.Modes
                 if (!trayTransitioning && WindowState == FormWindowState.Minimized) MinimizeToTray();
             };
             timer.Interval = 10000;
-            timer.Tick += delegate { RefreshReadOnly(); };
+            timer.Tick += delegate { if (working) UpdateStatusSummary(); else RefreshReadOnly(); };
             Shown += delegate
             {
                 // Toggling taskbar visibility may recreate the native handle.
@@ -186,10 +239,18 @@ namespace FastLinkDirectTool.Modes
             FormClosing += delegate(object s, FormClosingEventArgs e)
             {
                 if (allowClose) return;
+                if (e.CloseReason == CloseReason.UserClosing)
+                {
+                    // X / Alt+F4 has the same background-running behavior as
+                    // the legacy window. Never hide a live modal form.
+                    e.Cancel = true;
+                    MinimizeToTray();
+                    return;
+                }
                 if (working) { e.Cancel = true; RequestSafeClose(false); return; }
                 if (offlinePreview && !injectedPreviewSession) return;
-                // Window X and the exit button share one verified stop path.
-                // Closing the child alone must not silently leave the helper on.
+                // System shutdown and other non-user close requests still use
+                // the verified cleanup path, never the minimize-to-tray path.
                 e.Cancel = true;
                 RequestSafeClose(false);
             };
@@ -284,8 +345,8 @@ namespace FastLinkDirectTool.Modes
                 if (working && b != exitAction) return;
                 // Only a deliberately injected fake may exercise session actions.
                 // Preview checking/saving never reaches platform or profile IO.
-                if (offlinePreview && !(injectedPreviewSession &&
-                    (b == prepareAction || b == enableAction || b == stopAction || b == archiveAction || b == exitAction))) return;
+                if (offlinePreview && b != addRuleAction && b != deleteRuleAction && !(injectedPreviewSession &&
+                    (b == prepareAction || b == enableAction || b == stopAction || b == archiveAction || b == exitAction || (previewExplicitIntent && b == saveAction)))) return;
                 action();
             };
             actions.Controls.Add(b);
@@ -295,10 +356,36 @@ namespace FastLinkDirectTool.Modes
         {
             if (lastMessage == message) return;
             lastMessage = message;
+            operationStatus.Text = "最近操作：" + (message ?? "").Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
             details.AppendText(DateTime.Now.ToString("HH:mm:ss") + "  " + message + "\r\n");
             if (details.TextLength > 14000) details.Text = details.Text.Substring(details.TextLength - 10000);
             // An optional log sink must never strand the operation gate.
             try { log(message); } catch { }
+            UpdateStatusSummary();
+        }
+        private void ToggleSettings()
+        {
+            settingsExpanded = !settingsExpanded;
+            settingsPanel.Visible = settingsExpanded;
+            settingsAction.Text = settingsExpanded ? "收起设置" : "设置与日志";
+            rootLayout.RowStyles[6].Height = settingsExpanded ? 220 : 0;
+            Size = new Size(Width, settingsExpanded ? 860 : 640);
+        }
+        private void ShowSettings()
+        { if (!settingsExpanded) ToggleSettings(); }
+        private void UpdateStatusSummary()
+        {
+            int elapsed = Math.Max(0, (int)(DateTime.UtcNow - workingSinceUtc).TotalSeconds);
+            string state = working ? "正在处理，已用 " + elapsed + " 秒（请勿重复启动）" : session.IsActive ? "分流运行中" :
+                session.IsArmed && preparedVerificationPending ? "准备状态待核验，尚未确认有效" : session.HasPending ? "需要检查恢复记录" :
+                session.IsArmed ? "已准备，尚未开始分流" : "尚未开始";
+            string corp = corporate.SelectedItem == null ? "未选择（请在设置中指定）" : corporate.SelectedItem.ToString();
+            string net = internet.SelectedItem == null ? "未选择（请在设置中指定）" : internet.SelectedItem.ToString();
+            connectionSummary.Text = "公司内网：" + corp + "\r\n互联网：" + net;
+            modeNotice.Text = LegacySelected ? LegacyNotice : state + "\r\n点击“开始分流”表示公司网络已完成准入；外网连通性由程序检测。模式二 / 三不与 FastLink / aTrust 同时开启。";
+            ruleHint.Text = LegacySelected ? "这里保留双网草稿；切换到模式一后管理原 FastLink 规则。" :
+                working || HasOwnedState ? "规则可直接查看；修改前请先停止分流并完成清理。" :
+                "直接修改下表并保存。新增规则需自行选择“公司内网”或“互联网”。";
         }
         private void ResetNetworkConfirmations()
         {
@@ -311,22 +398,26 @@ namespace FastLinkDirectTool.Modes
         }
         private void SetWorking(bool value)
         {
+            if (value && !working) workingSinceUtc = DateTime.UtcNow;
             working = value; actions.Enabled = true;
             bool editable = !value && !HasOwnedState;
             mode.Enabled = editable;
             editable = editable && !LegacySelected;
             corporate.Enabled = internet.Enabled = cidrs.Enabled = editable;
             rules.ReadOnly = !editable; rules.AllowUserToAddRows = rules.AllowUserToDeleteRows = editable;
+            addRuleAction.Enabled = deleteRuleAction.Enabled = editable;
             confirmed.Enabled = editable;
             permitted.Enabled = !value && !LegacySelected && !session.IsActive;
             externalOk.Enabled = offlinePreview && !value && !LegacySelected && !session.IsActive;
             admission.Enabled = !value && !LegacySelected && !session.IsActive;
             checkAction.Enabled = saveAction.Enabled = prepareAction.Enabled = !value && !LegacySelected;
-            enableAction.Enabled = stopAction.Enabled = !value;
+            enableAction.Enabled = !value && (!session.IsActive || LegacySelected);
+            stopAction.Enabled = !value && HasOwnedState;
             archiveAction.Enabled = !value && !session.IsActive && !session.IsArmed && session.HasPending;
             exitAction.Enabled = true;
-            enableAction.Text = LegacySelected ? "切换到模式一" : "启用双网分流";
-            modeNotice.Text = LegacySelected ? LegacyNotice : "模式二 / 三：公司规则按 IPv4 分流，可保留已核验的外网 IPv6；不与 FastLink / aTrust 同时启用。\r\n先准备外网优先，再连接公司接口并确认准入。公司须允许双网；本工具不解除企业限制或强制重连。";
+            enableAction.Text = LegacySelected ? "切换到模式一" : "开始分流";
+            stopAction.Text = "停止分流";
+            UpdateStatusSummary();
             if (!value && closeQueued && !allowClose && !IsDisposed)
             {
                 closeQueued = false;
@@ -352,6 +443,27 @@ namespace FastLinkDirectTool.Modes
                 });
             }
             catch (InvalidOperationException) { if (!IsDisposed && !Disposing) throw; }
+        }
+        private void AddRule()
+        {
+            if (working || closing || HasOwnedState || LegacySelected) return;
+            rules.EndEdit();
+            int index = rules.Rows.Add(string.Empty, TargetText(RuleTarget.Review));
+            rules.ClearSelection();
+            rules.Rows[index].Selected = true;
+            rules.CurrentCell = rules.Rows[index].Cells[0];
+            confirmed.Checked = false;
+            rules.Focus(); rules.BeginEdit(true);
+        }
+        private void DeleteSelectedRules()
+        {
+            if (working || closing || HasOwnedState || LegacySelected) return;
+            rules.EndEdit();
+            List<DataGridViewRow> selected = rules.SelectedRows.Cast<DataGridViewRow>()
+                .Where(row => !row.IsNewRow).OrderByDescending(row => row.Index).ToList();
+            if (selected.Count == 0) { Tell("请先选中要删除的规则。"); return; }
+            foreach (DataGridViewRow row in selected) rules.Rows.Remove(row);
+            confirmed.Checked = false;
         }
         private ModeRequest RequestFromUi()
         {
@@ -383,12 +495,29 @@ namespace FastLinkDirectTool.Modes
         }
         private void SaveProfile()
         {
+            if (working || closing || allowClose || IsDisposed || Disposing || LegacySelected) return;
             try
             {
-                RequestFromUi(); RememberPermission(); DualProfileStore.Save(profile);
+                RequestFromUi();
+                if (!offlinePreview || previewExplicitIntent) ConfirmExplicitRuleChoice();
+                if (offlinePreview) { Tell("离线确认规则分类：未写文件、未改网络。"); return; }
+                RememberPermission(); DualProfileStore.Save(profile);
                 Tell("双网配置已单独保存；未改原 FastLink 规则，也未启用网络分流。");
             }
             catch (Exception ex) { Tell("保存失败：" + ex.Message); }
+        }
+        private void ConfirmExplicitRuleChoice()
+        {
+            if (profile.Rules.Any(r => r.Target == RuleTarget.Review))
+                throw new InvalidOperationException("还有规则未选择公司内网或互联网；请先完成分类。");
+            foreach (ModeRule rule in profile.Rules)
+            {
+                ParsedModeRule parsed; string error;
+                if (!PlanningValidation.TryRule(rule, out parsed, out error)) throw new InvalidOperationException(error);
+            }
+            // Saving or explicitly starting is the confirmation of the visible
+            // classifications, not an inference from the destination's name.
+            profile.RulesConfirmed = confirmed.Checked = true;
         }
         private sealed class AdapterChoice
         {
@@ -418,7 +547,17 @@ namespace FastLinkDirectTool.Modes
             if (working || closing) return;
             if (session.HasPending)
             {
-                Tell("安全清理尚未完成，自动检查与自动清理已暂停；若网络已自行恢复，可先“核对旧会话记录”（不改网络），否则手动恢复清理。");
+                // HasPending can conservatively mean that a route callback owns
+                // the runtime lock. Never wait for that lock on the UI thread.
+                SetWorking(true);
+                Task.Run(delegate { return session.ValidateCurrent(); }).ContinueWith(t => CompleteOnUi(delegate
+                {
+                    preparedVerificationPending = !session.IsActive && session.IsArmed && (t.IsFaulted || !t.Result.Success);
+                    if (t.IsFaulted || (!t.IsFaulted && t.Result.Pending)) { automaticChecksPaused = true; closeQueued = false; }
+                    if (t.IsFaulted) Tell("状态核验未完成：" + t.Exception.GetBaseException().Message);
+                    else Tell((t.Result.Pending ? "分流已暂停；" : "") + t.Result.Message +
+                        (t.Result.Pending ? " 可在设置中查看日志或停止并恢复。" : ""));
+                }));
                 return;
             }
             if (automaticChecksPaused)
@@ -431,30 +570,29 @@ namespace FastLinkDirectTool.Modes
             try { request = RequestFromUi(); } catch (Exception ex) { Tell(ex.Message); return; }
             SetWorking(true);
             bool invalidated = false;
+            bool preparationUnverified = false;
             Task.Run(delegate
             {
-                if (session.IsActive)
+                if (session.IsActive || session.IsArmed)
                 {
                     DualOperationResult validity = session.ValidateCurrent();
-                    invalidated = !validity.Success || !session.IsActive;
-                    return Tuple.Create<NetworkSnapshot, string>(null, validity.Message);
+                    preparationUnverified = !session.IsActive && session.IsArmed && !validity.Success;
+                    invalidated = validity.State != "ReadDeferred" && (!validity.Success || (!session.IsActive && !session.IsArmed));
+                    return Tuple.Create(validity.VerifiedPreparationSnapshot, validity.Message);
                 }
                 NetworkSnapshot snapshot = platform.Capture();
-                bool lostInternet = !snapshot.Adapters.Any(a => a.Id == request.InternetAdapterId && a.IsUp);
-                bool conflict = snapshot.SystemProxyActive || snapshot.TunnelActive || snapshot.OtherDnsPolicyPresent || NetworkModePlanner.Ipv6CompatibilityBlocker(request, snapshot) != null;
-                if (session.IsArmed && (lostInternet || conflict))
-                {
-                    invalidated = true;
-                    DualOperationResult stopped = session.Stop(false);
-                    return Tuple.Create(snapshot, "网络条件变化，已暂停并尝试清理：" + stopped.Message);
-                }
                 ModePlan plan = NetworkModePlanner.Build(request, snapshot);
                 string state = session.HasPending ? "存在待恢复记录，请先点“停用 / 恢复清理”。" : session.IsActive ? "双网分流运行中；尚需实际业务验收。" : session.IsArmed ? "已执行准备，尚未启用域名分流；请核实公司路由与准入后，手动点击启用。" : "未启用：" + string.Join("；", plan.Blockers.Take(5).ToArray());
                 return Tuple.Create(snapshot, state);
             }).ContinueWith(t => CompleteOnUi(delegate
             {
-                if (t.IsFaulted || invalidated || session.HasPending) automaticChecksPaused = true;
-                if (t.IsFaulted || session.HasPending || invalidated) closeQueued = false;
+                // HasPending also conservatively returns true while DNS owns
+                // the runtime lock. A live session busy on a read is not a
+                // cleanup failure and must not disable future validation.
+                bool actualPending = !session.IsActive && !session.IsArmed && session.HasPending;
+                preparedVerificationPending = preparationUnverified || (t.IsFaulted && !session.IsActive && session.IsArmed);
+                if (t.IsFaulted || invalidated || actualPending) automaticChecksPaused = true;
+                if (t.IsFaulted || actualPending || invalidated) closeQueued = false;
                 if (!t.IsFaulted)
                 {
                     if (t.Result.Item1 != null)
@@ -481,11 +619,16 @@ namespace FastLinkDirectTool.Modes
         }
         private void Change(bool enable, bool explicitLaunchAction = false)
         {
-            if (working || closing) return;
+            if (working || closing || allowClose || IsDisposed || Disposing) return;
             if (offlinePreview && !injectedPreviewSession) return;
             if (LegacySelected) { Tell("模式一不执行双网预备或启用，请点击“切换到模式一”。"); return; }
             ModeRequest request;
             try { request = RequestFromUi(); } catch (Exception ex) { Tell(ex.Message); return; }
+            if (!PrepareExplicitIntent(enable, explicitLaunchAction)) return;
+            // The permission dialog pumps UI messages. Its completion can drain
+            // a queued explicit exit, so do not persist or schedule work after
+            // that exit won the race, even if the dialog returned Yes.
+            if (closing || allowClose || IsDisposed || Disposing) return;
             if (!confirmed.Checked || profile.Rules.Any(r => r.Target == RuleTarget.Review)) { Tell("请先确认规则分类；待确认项不会自动分配出口。"); return; }
             if (!permitted.Checked) { Tell("请首次确认公司允许这台电脑双网并用；同一台电脑和这对接口会记住许可。"); return; }
             if (enable && !admission.Checked) { Tell("请在连接公司接口并通过 MOKA 后，确认准入；不需要再次安装安全软件。"); return; }
@@ -494,7 +637,7 @@ namespace FastLinkDirectTool.Modes
             SetWorking(true);
             if (explicitLaunchAction && (enable || HasOwnedState || !profile.IsPermissionConfirmed(platform.ScopeIdentity, profile.CorporateAdapterId, profile.InternetAdapterId)))
             { Tell("启动准备被拒绝：只允许已保存许可且没有未完成会话的全新准备。"); SetWorking(false); return; }
-            if (!offlinePreview && !explicitLaunchAction && MessageBox.Show(this, enable ? "将按已确认规则启用双网分流。异常时只恢复本助手自己的改动，不能保证会议会话不断线。继续？" : "将自动验证外网，再优先使用外网；公司接口已连接时准备公司路由。不代表已通过公司准入，也不会启用域名分流。继续准备？", "确认网络操作", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) { SetWorking(false); return; }
+            if (!offlinePreview && !explicitLaunchAction && !enable && MessageBox.Show(this, "将自动验证外网，再优先使用外网；公司接口已连接时准备公司路由。不代表已通过公司准入，也不会启用域名分流。继续准备？", "确认网络操作", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) { SetWorking(false); return; }
             try { if (!offlinePreview) { RememberPermission(); DualProfileStore.Save(profile); } } catch (Exception ex) { Tell("配置保存失败，未改网络：" + ex.Message); SetWorking(false); return; }
             Tell("正在自动验证所选外网与网络稳定性；不切换网卡、不启动 VPN。验证通过后才执行准备。");
             bool verified = false;
@@ -529,6 +672,31 @@ namespace FastLinkDirectTool.Modes
                 if (!offlinePreview) externalOk.Checked = verified;
                 Tell(t.IsFaulted ? "操作未完成：" + t.Exception.GetBaseException().Message : t.Result == null ? "未收到操作结果；未视为成功，可重试。" : t.Result.Message);
             }));
+        }
+        private bool PrepareExplicitIntent(bool enable, bool explicitLaunchAction)
+        {
+            if (closing || allowClose || IsDisposed || Disposing) return false;
+            if ((offlinePreview && !previewExplicitIntent) || explicitLaunchAction) return true;
+            try { ConfirmExplicitRuleChoice(); }
+            catch (Exception error) { ShowSettings(); Tell(error.Message); return false; }
+            if (!permitted.Checked)
+            {
+                SetWorking(true);
+                bool allowed = offlinePreview ? previewPermissionApproval != null && previewPermissionApproval() :
+                    MessageBox.Show(this, "是否已获得公司许可，在这台电脑同时使用所选公司网络和外网？\r\n同一用户和同一对网卡只确认一次；不会更改公司的安全策略。", "首次使用这对网络", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes;
+                bool exitWasQueued = closeQueued;
+                SetWorking(false);
+                // SetWorking(false) may have synchronously completed a queued
+                // explicit exit. A stale Yes must not revive the closed form.
+                if (exitWasQueued || closing || allowClose || IsDisposed || Disposing) return false;
+                if (!allowed) return false;
+                permitted.Checked = platform.DualConnectionConfirmed = true;
+            }
+            // Start is the current user assertion described next to the button,
+            // not an automatic claim that MOKA has authenticated. It is never
+            // persisted and is revoked by any observed role/topology change.
+            if (enable) admission.Checked = platform.CorporateAdmissionConfirmed = true;
+            return true;
         }
         private void RequestLegacyHandoff()
         { RequestSafeClose(true); }

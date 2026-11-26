@@ -158,9 +158,12 @@ namespace FastLinkDirectTool.Modes
             return WorkerHolder.Worker.Execute(script, timeout);
         }
 
-        private T Execute<T>(string script, int timeout)
+        private T Execute<T>(string script, int timeout, bool readOnly = false)
         {
             DualCommandResult result = runner(script, timeout);
+            if (readOnly && result != null && result.TimedOut && result.ExitCode == -1 &&
+                (result.ErrorCode == "worker_timeout:startup" || result.ErrorCode == "worker_timeout:send" || result.ErrorCode == "worker_timeout:response"))
+                throw new DualReadUnavailableException(result.ErrorCode);
             if (result == null || result.TimedOut) throw new InvalidOperationException("双网命令超时；保留事务记录，未假定操作成功。");
             if (result.ExitCode != 0) throw new InvalidOperationException("双网命令失败；保留事务记录，请检查权限或网络状态。" + (string.IsNullOrEmpty(result.ErrorCode) ? "" : " [" + result.ErrorCode + "]"));
             string[] records = (result.Output ?? string.Empty).Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
@@ -202,7 +205,7 @@ namespace FastLinkDirectTool.Modes
             {
                 try
                 {
-                DualCaptureData data = Execute<DualCaptureData>(BuildCaptureScript(sessionOwners), 20000);
+                DualCaptureData data = Execute<DualCaptureData>(BuildCaptureScript(sessionOwners), 20000, true);
                 if (data.Adapters == null || data.Defaults == null) throw new InvalidOperationException("网络快照缺少必要字段。");
                 Dictionary<string, DualAdapterData> fresh = new Dictionary<string, DualAdapterData>(StringComparer.OrdinalIgnoreCase);
                 NetworkSnapshot snapshot = new NetworkSnapshot
@@ -268,6 +271,13 @@ namespace FastLinkDirectTool.Modes
                 }
                 return snapshot;
                 }
+                catch (DualReadUnavailableException)
+                {
+                    // No network mutation was possible and the worker is gone.
+                    // Retain only the previous proof; the next successful
+                    // Capture still invalidates it on any topology change.
+                    throw;
+                }
                 catch
                 {
                     ClearInternetProof();
@@ -283,7 +293,7 @@ namespace FastLinkDirectTool.Modes
                 ValidateResource(resource);
                 if (resource.Kind != DualResourceKind.Nrpt && !bindings.ContainsKey(CanonicalGuid(resource.InterfaceId))) Capture();
                 if (resource.Kind == DualResourceKind.Nrpt) sessionOwners.Add(resource.Owner);
-                string value = Execute<DualValueData>(BuildResourceScript(resource, "read", null), 15000).Value;
+                string value = Execute<DualValueData>(BuildResourceScript(resource, "read", null), 15000, true).Value;
                 observed[ResourceKey(resource)] = value;
                 return value;
             }
