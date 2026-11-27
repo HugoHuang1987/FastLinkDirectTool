@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -8,6 +9,7 @@ using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Web.Script.Serialization;
 
 namespace FastLinkDirectTool.Modes
@@ -58,6 +60,84 @@ namespace FastLinkDirectTool.Modes
         public string Value { get; set; }
     }
 
+    // At most one queued/in-flight diagnostic write. A stalled log sink drops
+    // subsequent diagnostics instead of blocking platform locks or adding workers.
+    internal sealed class DualTimingPublisher
+    {
+        private readonly Action<IDictionary<string, object>> sink;
+        private int busy;
+        internal DualTimingPublisher(Action<IDictionary<string, object>> sink) { this.sink = sink; }
+        internal void Post(IDictionary<string, object> data)
+        {
+            if (sink == null || Interlocked.CompareExchange(ref busy, 1, 0) != 0) return;
+            try
+            {
+                if (!ThreadPool.QueueUserWorkItem(delegate
+                {
+                    try { sink(data); } catch { }
+                    finally { Interlocked.Exchange(ref busy, 0); }
+                })) Interlocked.Exchange(ref busy, 0);
+            }
+            catch { Interlocked.Exchange(ref busy, 0); }
+        }
+    }
+
+    // Bounded, metadata-only windows. No scripts, destinations, DNS answers or
+    // exception text are retained. Logging failure must not affect networking.
+    internal sealed class DualCommandTiming
+    {
+        private readonly Action<IDictionary<string, object>> publish;
+        private readonly Func<long> milliseconds;
+        private readonly Dictionary<string, long> counts = new Dictionary<string, long>();
+        private readonly Dictionary<string, long> durations = new Dictionary<string, long>();
+        private long windowStart, lastPublished, total, maximum;
+        private string maximumOperation = "other";
+        private int count, failed, timeouts;
+        private bool started, published;
+        internal DualCommandTiming(Action<IDictionary<string, object>> sink, Func<long> monotonicMilliseconds)
+        { publish = sink; milliseconds = monotonicMilliseconds; }
+        internal void Observe(string operation, long elapsed, bool verified, bool timedOut)
+        {
+            if (publish == null) return;
+            try
+            {
+                // These are caller-supplied constants, not values from a child.
+                switch (operation)
+                {
+                    case "capture": case "read.Metric4": case "write.Metric4":
+                    case "read.Route4": case "write.Route4": case "remove.Route4":
+                    case "read.Nrpt": case "write.Nrpt": case "remove.Nrpt": break;
+                    default: operation = "other"; break;
+                }
+                long now = milliseconds();
+                if (!started) { windowStart = now; started = true; }
+                elapsed = Math.Max(0, elapsed);
+                count++; total += elapsed;
+                if (elapsed >= maximum) { maximum = elapsed; maximumOperation = operation; }
+                if (!verified) failed++;
+                if (timedOut) timeouts++;
+                long n; counts.TryGetValue(operation, out n); counts[operation] = n + 1;
+                durations.TryGetValue(operation, out n); durations[operation] = n + elapsed;
+                bool interval = now - windowStart >= 30000;
+                bool failure = !verified && (!published || now - lastPublished >= 5000);
+                if (!interval && !failure) return;
+                Dictionary<string, object> data = new Dictionary<string, object> {
+                    { "window_ms", Math.Max(0, now - windowStart) }, { "command_count", count },
+                    { "command_total_ms", total }, { "command_max_ms", maximum },
+                    { "command_response_error_count", failed }, { "timeout_count", timeouts },
+                    { "operation_counts", new Dictionary<string, long>(counts) },
+                    { "operation_total_ms", new Dictionary<string, long>(durations) },
+                    { "command_max_operation", maximumOperation }
+                };
+                // Reset before calling the optional observer, including if it fails.
+                count = failed = timeouts = 0; total = maximum = 0; counts.Clear(); durations.Clear(); maximumOperation = "other";
+                windowStart = lastPublished = now; published = true;
+                publish(data);
+            }
+            catch { /* Diagnostics never changes the command result. */ }
+        }
+    }
+
     // Construction is inert. Capture performs bounded reads only. Network writes
     // are exposed solely through the transaction interface and revalidate identity.
     public sealed class DualNetworkWindowsPlatform : IDualNetworkPlatform
@@ -73,6 +153,7 @@ namespace FastLinkDirectTool.Modes
         private readonly Func<bool> administrator;
         private readonly Func<DateTime> clock;
         private readonly string scope;
+        private readonly DualCommandTiming timing;
         private readonly object sync = new object();
         private readonly Dictionary<string, DualAdapterData> bindings = new Dictionary<string, DualAdapterData>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> sessionOwners = new HashSet<string>(StringComparer.Ordinal);
@@ -126,14 +207,26 @@ namespace FastLinkDirectTool.Modes
         public bool IsAdministrator { get { return administrator(); } }
         public string ScopeIdentity { get { return scope; } }
 
-        public DualNetworkWindowsPlatform() : this(RunHidden, CurrentAdministrator, delegate { return DateTime.UtcNow; }, CurrentScope()) { }
+        public DualNetworkWindowsPlatform() : this(RunHidden, CurrentAdministrator, delegate { return DateTime.UtcNow; }, CurrentScope(),
+            delegate(IDictionary<string, object> data) { HealthEventLogger.Write("dual_command_timing", data); }) { }
 
         public DualNetworkWindowsPlatform(Func<string, int, DualCommandResult> commandRunner,
             Func<bool> isAdministrator, Func<DateTime> utcClock, string scopeIdentity)
+            : this(commandRunner, isAdministrator, utcClock, scopeIdentity, null) { }
+
+        internal DualNetworkWindowsPlatform(Func<string, int, DualCommandResult> commandRunner,
+            Func<bool> isAdministrator, Func<DateTime> utcClock, string scopeIdentity,
+            Action<IDictionary<string, object>> timingSink)
         {
             if (commandRunner == null || isAdministrator == null || utcClock == null || string.IsNullOrWhiteSpace(scopeIdentity))
                 throw new ArgumentException("Missing platform dependency.");
             runner = commandRunner; administrator = isAdministrator; clock = utcClock; scope = scopeIdentity;
+            if (timingSink != null)
+            {
+                var publisher = new DualTimingPublisher(timingSink);
+                timing = new DualCommandTiming(publisher.Post,
+                    delegate { return (long)(Stopwatch.GetTimestamp() * (1000.0 / Stopwatch.Frequency)); });
+            }
         }
 
         private static bool CurrentAdministrator()
@@ -158,9 +251,26 @@ namespace FastLinkDirectTool.Modes
             return WorkerHolder.Worker.Execute(script, timeout);
         }
 
-        private T Execute<T>(string script, int timeout, bool readOnly = false)
+        private T Execute<T>(string script, int timeout, bool readOnly = false, string operation = "other")
         {
-            DualCommandResult result = runner(script, timeout);
+            Stopwatch timer = timing == null ? null : Stopwatch.StartNew();
+            DualCommandResult result = null;
+            bool verified = false;
+            try
+            {
+                result = runner(script, timeout);
+                T value = Decode<T>(result, readOnly);
+                verified = true;
+                return value;
+            }
+            finally
+            {
+                if (timing != null) timing.Observe(operation, timer.ElapsedMilliseconds, verified, result != null && result.TimedOut);
+            }
+        }
+
+        private static T Decode<T>(DualCommandResult result, bool readOnly)
+        {
             if (readOnly && result != null && result.TimedOut && result.ExitCode == -1 &&
                 (result.ErrorCode == "worker_timeout:startup" || result.ErrorCode == "worker_timeout:send" || result.ErrorCode == "worker_timeout:response"))
                 throw new DualReadUnavailableException(result.ErrorCode);
@@ -205,7 +315,7 @@ namespace FastLinkDirectTool.Modes
             {
                 try
                 {
-                DualCaptureData data = Execute<DualCaptureData>(BuildCaptureScript(sessionOwners), 20000, true);
+                DualCaptureData data = Execute<DualCaptureData>(BuildCaptureScript(sessionOwners), 20000, true, "capture");
                 if (data.Adapters == null || data.Defaults == null) throw new InvalidOperationException("网络快照缺少必要字段。");
                 Dictionary<string, DualAdapterData> fresh = new Dictionary<string, DualAdapterData>(StringComparer.OrdinalIgnoreCase);
                 NetworkSnapshot snapshot = new NetworkSnapshot
@@ -293,7 +403,7 @@ namespace FastLinkDirectTool.Modes
                 ValidateResource(resource);
                 if (resource.Kind != DualResourceKind.Nrpt && !bindings.ContainsKey(CanonicalGuid(resource.InterfaceId))) Capture();
                 if (resource.Kind == DualResourceKind.Nrpt) sessionOwners.Add(resource.Owner);
-                string value = Execute<DualValueData>(BuildResourceScript(resource, "read", null), 15000, true).Value;
+                string value = Execute<DualValueData>(BuildResourceScript(resource, "read", null), 15000, true, "read." + resource.Kind).Value;
                 observed[ResourceKey(resource)] = value;
                 return value;
             }
@@ -306,7 +416,7 @@ namespace FastLinkDirectTool.Modes
                 if (!IsAdministrator) throw new InvalidOperationException("双网操作需要管理员权限；不会自动提权。");
                 ValidateResource(resource); ValidateValue(resource, value);
                 if (resource.Kind == DualResourceKind.Nrpt) sessionOwners.Add(resource.Owner);
-                DualValueData result = Execute<DualValueData>(BuildResourceScript(resource, "write", value), 20000);
+                DualValueData result = Execute<DualValueData>(BuildResourceScript(resource, "write", value), 20000, false, "write." + resource.Kind);
                 if (!DualNetworkRuntime.ResourceValuesEqual(resource, result.Value, value)) throw new InvalidOperationException("写入后读回不一致，保留恢复记录。");
                 observed[ResourceKey(resource)] = result.Value;
             }
@@ -319,7 +429,7 @@ namespace FastLinkDirectTool.Modes
                 if (!IsAdministrator) throw new InvalidOperationException("清理双网设置需要管理员权限；不会自动提权。");
                 ValidateResource(resource);
                 if (resource.Kind == DualResourceKind.Metric4) throw new InvalidOperationException("接口跃点不能删除；必须恢复原值。");
-                DualValueData result = Execute<DualValueData>(BuildResourceScript(resource, "remove", null), 20000);
+                DualValueData result = Execute<DualValueData>(BuildResourceScript(resource, "remove", null), 20000, false, "remove." + resource.Kind);
                 if (result.Value != null) throw new InvalidOperationException("移除后仍有对应设置，保留恢复记录。");
                 observed[ResourceKey(resource)] = null;
             }
@@ -461,7 +571,10 @@ namespace FastLinkDirectTool.Modes
             else if (resource.Kind == DualResourceKind.Route4)
             {
                 script.Append("$destination=").Append(Q(resource.Destination)).Append(";$next=").Append(Q(resource.NextHop)).Append(";\n")
-                    .Append("function Read-Routes { return @(Get-NetRoute -AddressFamily IPv4 -InterfaceIndex $ix -PolicyStore ActiveStore -ErrorAction Stop | Where-Object { $_.DestinationPrefix -eq $destination -and $_.NextHop -eq $next }) };$r=@(Read-Routes);if($r.Count -gt 1){throw 'ambiguous_exact_route'};\n");
+                    .Append("function Read-Routes { return @(Get-NetRoute -AddressFamily IPv4 -InterfaceIndex $ix -PolicyStore ActiveStore -ErrorAction Stop | Where-Object { $_.DestinationPrefix -eq $destination -and $_.NextHop -eq $next }) };\n");
+                // A pure read needs one final observation. Mutations still read
+                // before and after the write; never cache across commands.
+                if (operation != "read") script.Append("$r=@(Read-Routes);if($r.Count -gt 1){throw 'ambiguous_exact_route'};\n");
                 if (operation != "remove")
                     script.Append("$competing=@(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Where-Object { $_.DestinationPrefix -eq $destination -and ($_.InterfaceIndex -ne $ix -or $_.NextHop -ne $next) });if($competing.Count -gt 0){throw 'conflicting_destination_route'};\n");
                 if (operation == "write")
@@ -477,7 +590,8 @@ namespace FastLinkDirectTool.Modes
             else
             {
                 script.Append("$ns=").Append(Q(resource.Namespace.ToLowerInvariant())).Append(";$owner=").Append(Q(resource.Owner)).Append(";\n")
-                    .Append("function Read-Nrpt { return @(Get-DnsClientNrptRule -ErrorAction Stop | Where-Object { @($_.Namespace) -icontains $ns }) };$r=@(Read-Nrpt);if($r.Count -gt 1){throw 'ambiguous_nrpt_namespace'};\n");
+                    .Append("function Read-Nrpt { return @(Get-DnsClientNrptRule -ErrorAction Stop | Where-Object { @($_.Namespace) -icontains $ns }) };\n");
+                if (operation != "read") script.Append("$r=@(Read-Nrpt);if($r.Count -gt 1){throw 'ambiguous_nrpt_namespace'};\n");
                 if (operation == "write")
                 {
                     foreach (string role in new[] { CorporateAdapterId, InternetAdapterId })

@@ -27,11 +27,12 @@ namespace FastLinkDirectTool.Tests
             internal DualJournalDocument Archived;
             internal DualReconciliationReport Evidence;
             internal Action BeforeArchive;
+            internal Action<DualJournalDocument> BeforeSave;
             private readonly JavaScriptSerializer serializer = new JavaScriptSerializer();
             private DualJournalDocument Clone(DualJournalDocument value)
             { return value == null ? null : serializer.Deserialize<DualJournalDocument>(serializer.Serialize(value)); }
             public DualJournalDocument Load() { Loads++; if (FailLoad) throw new Exception("fixture load"); return Clone(Stored); }
-            public void Save(DualJournalDocument value) { Saves++; if (Saves == FailSaveAt) throw new Exception("fixture save"); Stored = Clone(value); }
+            public void Save(DualJournalDocument value) { Saves++; if (BeforeSave != null) BeforeSave(value); if (Saves == FailSaveAt) throw new Exception("fixture save"); Stored = Clone(value); }
             public void Delete() { Deletes++; if (FailDelete) throw new Exception("fixture delete"); Stored = null; }
             public string ArchiveVerified(DualJournalDocument expected, DualReconciliationReport evidence)
             {
@@ -85,15 +86,34 @@ namespace FastLinkDirectTool.Tests
         private sealed class FakeDns : IDualDnsService
         {
             internal List<string> Calls;
-            internal bool Running, FailStart, FailStop;
-            internal int Starts, Pauses, Stops;
+            internal bool Running, FailStart, FailStop, FailResume, FailPause;
+            internal int Starts, Pauses, Stops, Resumes;
             internal long Generation;
             internal Func<long, RuleTarget, string[], bool> Callback;
+            internal Action BeforeResume;
+            internal Action AfterStartPaused;
+            private readonly DualDnsAdmission admission = new DualDnsAdmission();
             public bool IsRunning { get { return Running; } }
-            public void Start(ModeRequest request, NetworkSnapshot snapshot, long generation, Func<long, RuleTarget, string[], bool> callback)
-            { Starts++; Generation = generation; Callback = callback; if (FailStart) throw new Exception("fixture DNS start"); Running = true; Calls.Add("dns:start"); }
-            public void Pause() { Pauses++; Calls.Add("dns:pause"); }
-            public void Stop() { Stops++; Calls.Add("dns:stop"); if (FailStop) throw new Exception("fixture DNS stop"); Running = false; }
+            public long StartPaused(ModeRequest request, NetworkSnapshot snapshot, long generation, Func<long, RuleTarget, string[], bool> callback)
+            {
+                Starts++; Generation = generation; Callback = callback; if (FailStart) throw new Exception("fixture DNS start");
+                long token = admission.StartPaused(DualDnsSession.Create(request, snapshot, generation, callback));
+                Running = true; Calls.Add("dns:start"); if (AfterStartPaused != null) AfterStartPaused(); return token;
+            }
+            public bool Resume(long generation, long activationToken)
+            {
+                if (BeforeResume != null) BeforeResume();
+                if (FailResume || !Running || !admission.Resume(generation, activationToken)) return false;
+                Resumes++; Calls.Add("dns:resume"); return true;
+            }
+            internal bool ResolveRoute(string address)
+            {
+                DualDnsAdmission.State captured = admission.Capture();
+                if (!Running || !admission.IsCurrent(captured)) return false;
+                return captured.Session.RouteCallback(captured.Session.Generation, RuleTarget.Corporate, new[] { address }) && admission.IsCurrent(captured);
+            }
+            public void Pause() { admission.Pause(); Pauses++; Calls.Add("dns:pause"); if (FailPause) throw new TimeoutException("fixture DNS send drain timeout"); }
+            public void Stop() { admission.Pause(); Stops++; Calls.Add("dns:stop"); if (FailStop) throw new Exception("fixture DNS stop"); Running = false; }
         }
 
         private sealed class Fixture
@@ -187,6 +207,22 @@ namespace FastLinkDirectTool.Tests
                 if (Directory.Exists(directory)) Directory.Delete(directory, true);
             }
         }
+        private static Fixture ProtectedModeThree()
+        {
+            Fixture f = new Fixture();
+            f.Request.Mode = WorkMode.WifiCorporateWiredInternet;
+            f.Platform.Snapshot.Adapters[0].Kind = LinkKind.Wifi;
+            f.Platform.Snapshot.Adapters[1].Kind = LinkKind.Ethernet;
+            f.Start();
+            // Trigger an ordinary readback failure, then restore the fixture's
+            // healthy ordinary topology before the next manual Start.
+            f.Platform.Snapshot.Adapters[0].Address = "192.0.2.11";
+            Assert(!f.Runtime.ValidateCurrent().Success, "failed topology fixture did not stop");
+            f.AssertProtected();
+            f.Platform.Snapshot.Adapters[0].Address = "192.0.2.10";
+            return f;
+        }
+
         public static int Main()
         {
             try
@@ -340,6 +376,100 @@ namespace FastLinkDirectTool.Tests
                     Assert(f.Runtime.Start(f.Request, true).Success && f.Platform.Writes == writes && f.Dns.Starts == starts && f.Platform.Captures == captures, "Duplicate start mutated.");
                     Assert(f.Journal.Stored.Entries.All(delegate(DualJournalEntry e) { return e.Applied; }), "Unverified entries reported active.");
                     Assert(f.Runtime.Stop(true).Success, "Stop failed."); f.AssertClean();
+                });
+                Test("startup DNS admission fails fast until NRPT final snapshot and Running save finish", delegate
+                {
+                    Fixture f = new Fixture(); ManualResetEvent entered = new ManualResetEvent(false), release = new ManualResetEvent(false);
+                    bool finalSnapshot = false, queryAccepted = true; DualOperationResult result = null; Exception startError = null;
+                    f.Platform.CaptureOverride = delegate { if (f.Dns.Running) finalSnapshot = true; return f.Platform.Snapshot; };
+                    f.Platform.BeforeWrite = delegate
+                    {
+                        if (f.Dns.Running && !entered.WaitOne(0)) { entered.Set(); if (!release.WaitOne(5000)) throw new Exception("fixture startup wait"); }
+                    };
+                    f.Dns.BeforeResume = delegate
+                    {
+                        Assert(finalSnapshot && f.Journal.Stored.Phase == "Running", "DNS opened before final snapshot or Running persistence.");
+                        Assert(f.Journal.Stored.Entries.Count(e => e.Resource.Kind == DualResourceKind.Nrpt && e.Applied && !e.Restored) == 2, "DNS opened before all NRPT readbacks.");
+                    };
+                    Thread starter = new Thread(delegate() { try { result = f.Runtime.Start(f.Request, true); } catch (Exception ex) { startError = ex; } });
+                    Thread query = new Thread(delegate() { queryAccepted = f.Dns.ResolveRoute("192.0.2.90"); });
+                    starter.Start();
+                    try
+                    {
+                        Assert(entered.WaitOne(2000), "Startup did not reach frozen NRPT write.");
+                        Assert(f.Journal.Stored.Phase == "Starting" && f.Dns.Resumes == 0, "Startup admitted queries early.");
+                        query.Start(); Assert(query.Join(1000) && !queryAccepted, "DNS query waited behind the startup lock or returned an unverified answer.");
+                    }
+                    finally
+                    {
+                        release.Set(); Assert(starter.Join(5000), "Startup worker did not finish.");
+                        if (query.ThreadState != System.Threading.ThreadState.Unstarted) Assert(query.Join(5000), "Query worker did not finish.");
+                        f.Platform.BeforeWrite = null;
+                        entered.Dispose(); release.Dispose();
+                    }
+                    Assert(startError == null && result != null && result.Success && f.Dns.Resumes == 1, "Startup failed after releasing the gate.");
+                    Assert(f.Dns.ResolveRoute("192.0.2.90"), "Completed startup did not retain the route ownership gate.");
+                });
+                Test("same-thread DNS callbacks cannot write routes before startup persistence commits", delegate
+                {
+                    Fixture f = new Fixture(); int rejected = 0;
+                    Action probe = delegate
+                    {
+                        int writes = f.Platform.Writes, reads = f.Platform.Reads, captures = f.Platform.Captures;
+                        Assert(!f.Dns.Callback(f.Dns.Generation, RuleTarget.Corporate, new[] { "192.0.2.90" }), "Startup callback was accepted.");
+                        Assert(f.Platform.Writes == writes && f.Platform.Reads == reads && f.Platform.Captures == captures, "Startup callback performed route work."); rejected++;
+                    };
+                    f.Dns.AfterStartPaused = probe;
+                    f.Journal.BeforeSave = delegate(DualJournalDocument value) { if (value.Phase == "Running") probe(); };
+                    f.Start(); f.Journal.BeforeSave = null;
+                    Assert(rejected == 2 && f.Dns.ResolveRoute("192.0.2.90"), "Committed callback did not retain route validation.");
+                });
+                Test("startup failures before activation never open DNS admission", delegate
+                {
+                    for (int stage = 0; stage < 4; stage++)
+                    {
+                        Fixture f = new Fixture();
+                        if (stage == 0) f.Platform.FailWriteKind = DualResourceKind.Nrpt;
+                        if (stage == 1) f.Platform.CaptureOverride = delegate
+                        { if (f.Dns.Running) { f.Platform.CaptureOverride = null; throw new Exception("fixture final snapshot"); } return f.Platform.Snapshot; };
+                        if (stage == 2) f.Journal.BeforeSave = delegate(DualJournalDocument value)
+                        { if (value.Phase == "Running") { f.Journal.BeforeSave = null; throw new Exception("fixture Running save"); } };
+                        if (stage == 3) f.Dns.FailResume = true;
+                        Assert(!f.Runtime.Start(f.Request, true).Success && f.Dns.Resumes == 0 && !f.Dns.ResolveRoute("192.0.2.90"), "Failed startup admitted DNS at stage " + stage);
+                        f.AssertProtected();
+                    }
+                });
+                Test("activation cancelled by Pause cannot reopen and NRPT cleanup still precedes DNS stop", delegate
+                {
+                    Fixture f = new Fixture(); f.Dns.BeforeResume = delegate { f.Dns.Pause(); };
+                    Assert(!f.Runtime.Start(f.Request, true).Success && f.Dns.Resumes == 0, "Cancelled activation reopened DNS.");
+                    Assert(f.Platform.Calls.IndexOf("remove:Nrpt") < f.Platform.Calls.IndexOf("dns:stop"), "Activation failure stopped DNS before NRPT removal.");
+                    f.AssertProtected();
+                });
+                Test("activation failure with NRPT cleanup pending retains a paused listener", delegate
+                {
+                    Fixture f = new Fixture(); f.Dns.FailResume = true; f.Platform.FailRemoveKind = DualResourceKind.Nrpt;
+                    Assert(!f.Runtime.Start(f.Request, true).Success && f.Runtime.HasPending && f.Dns.Running && f.Dns.Stops == 0, "Pending NRPT lost its listener.");
+                    Assert(f.Dns.Resumes == 0 && !f.Dns.ResolveRoute("192.0.2.90"), "Pending startup admitted a DNS answer.");
+                    Assert(f.Runtime.Stop(true).Success, "Explicit cleanup failed."); f.AssertClean();
+                });
+                Test("send drain failure leaves NRPT DNS routes and priorities pending on Stop and Recover", delegate
+                {
+                    Fixture f = new Fixture(); f.Start(); f.Dns.FailPause = true;
+                    string journal = DualJournalFingerprint.Compute(f.Journal.Stored); int writes = f.Platform.Writes, removes = f.Platform.Removes;
+                    Assert(!f.Runtime.Stop(true).Success && f.Runtime.HasPending && f.Dns.Running && f.Dns.Stops == 0, "Stop ignored send drain failure.");
+                    Assert(f.Platform.Writes == writes && f.Platform.Removes == removes && DualJournalFingerprint.Compute(f.Journal.Stored) == journal, "Stop removed dependencies or changed journal after failed drain.");
+                    Assert(!f.Dns.ResolveRoute("192.0.2.90"), "Failed drain kept DNS admission open.");
+                    Assert(!f.Runtime.Recover(f.Request, true, true).Success && f.Dns.Stops == 0 && f.Platform.Writes == writes && f.Platform.Removes == removes, "Recover ignored send drain failure.");
+                    f.Dns.FailPause = false; Assert(f.Runtime.Stop(true).Success, "Later explicit cleanup failed."); f.AssertClean();
+                });
+                Test("failed activation plus failed send drain cannot continue automatic dependency cleanup", delegate
+                {
+                    Fixture f = new Fixture(); f.Dns.FailResume = true; f.Dns.FailPause = true;
+                    Assert(!f.Runtime.Start(f.Request, true).Success && f.Runtime.HasPending && f.Dns.Running && f.Dns.Stops == 0 && f.Platform.Removes == 0, "Automatic rollback ignored send drain failure.");
+                    Assert(f.Journal.Stored.Entries.Any(e => e.Resource.Kind == DualResourceKind.Nrpt && e.Applied && !e.Restored), "Pending NRPT journal was discarded.");
+                    Assert(!f.Dns.ResolveRoute("192.0.2.90"), "Automatic failure admitted an answer.");
+                    f.Dns.FailPause = false; Assert(f.Runtime.Stop(true).Success, "Later explicit cleanup failed."); f.AssertClean();
                 });
                 Test("cleanup order keeps DNS until NRPT verified then routes then metrics", delegate
                 {
@@ -658,8 +788,10 @@ namespace FastLinkDirectTool.Tests
                     Assert(!f.Dns.Callback(f.Dns.Generation,RuleTarget.Corporate,new[]{"192.0.2.90"}),"Unverified cached answer escaped.");
                     f.Now=f.Now.AddSeconds(5);
                     Assert(f.Dns.Callback(f.Dns.Generation,RuleTarget.Corporate,new[]{"192.0.2.91"})&&f.Runtime.LastFailure!=null,"Unrelated real read cleared the pending operation warning.");
-                    Assert(f.Runtime.ValidateCurrent().State=="ReadDeferred","Unrelated topology success cleared outstanding DNS read uncertainty.");
+                    f.Platform.BeforeRead=delegate{f.Platform.BeforeRead=null;throw new DualReadUnavailableException("worker_timeout:send");};
+                    Assert(f.Runtime.ValidateCurrent().State=="ReadDeferred"&&f.Runtime.LastFailure.Stage=="validate_deferred_dns_route","Unrelated topology success cleared outstanding DNS read uncertainty.");
                     f.Now=f.Now.AddSeconds(26);Assert(!f.Runtime.ValidateCurrent().Success,"Other cache traffic extended the total uncertainty budget.");f.AssertProtected();
+                    Assert(f.Runtime.LastFailure.Code=="read_verification_deadline"&&f.Runtime.LastFailure.Message.Contains("worker_timeout:send"),"Read deadline fabricated a new timeout or lost the original operation.");
                 });
                 Test("successful retry clears only its own failure when two DNS operations are unverified", delegate
                 {
@@ -669,6 +801,51 @@ namespace FastLinkDirectTool.Tests
                     Assert(!f.Dns.Callback(f.Dns.Generation,RuleTarget.Corporate,new[]{"192.0.2.91"}),"Second timeout escaped.");f.Now=f.Now.AddSeconds(5);
                     Assert(f.Dns.Callback(f.Dns.Generation,RuleTarget.Corporate,new[]{"192.0.2.90"})&&f.Runtime.LastFailure!=null,"One retry cleared another outstanding timeout.");
                     Assert(f.Dns.Callback(f.Dns.Generation,RuleTarget.Corporate,new[]{"192.0.2.91"})&&f.Runtime.LastFailure==null,"Both recovered operations did not clear warning.");
+                });
+                Test("validation rechecks a timed out cached route when the DNS client never repeats", delegate
+                {
+                    Fixture f = new Fixture(); f.Start();
+                    long epoch = f.Runtime.Generation;
+                    Assert(f.Dns.Callback(epoch, RuleTarget.Corporate, new[] { "192.0.2.90" }), "Initial DNS route failed.");
+                    f.Now = f.Now.AddSeconds(61);
+                    int writes = f.Platform.Writes, removes = f.Platform.Removes, saves = f.Journal.Saves;
+                    f.Platform.BeforeRead = delegate { f.Platform.BeforeRead = null; throw new DualReadUnavailableException("worker_timeout:send"); };
+                    Assert(!f.Dns.Callback(epoch, RuleTarget.Corporate, new[] { "192.0.2.90" }), "Timed out DNS answer escaped.");
+                    int reads = f.Platform.Reads, captures = f.Platform.Captures;
+                    Assert(f.Runtime.ValidateCurrent().State == "ReadDeferred" && f.Platform.Reads == reads && f.Platform.Captures == captures, "Cooldown performed I/O.");
+                    f.Now = f.Now.AddSeconds(5);
+                    Assert(f.Runtime.ValidateCurrent().Success && f.Platform.Reads == reads + 1 && f.Platform.Captures == captures + 1 && f.Runtime.LastFailure == null, "A successful targeted recheck did not clear the deferred warning.");
+                    f.Now = f.Now.AddSeconds(31);
+                    Assert(f.Runtime.ValidateCurrent().Success && f.Runtime.IsActive && f.Runtime.Generation == epoch && f.Platform.Writes == writes &&
+                        f.Platform.Removes == removes && f.Journal.Saves == saves, "Retried DNS callback or retained a stale deadline.");
+                });
+                Test("validation verifies the exact failed DNS route and preserves external removal", delegate
+                {
+                    Fixture f = new Fixture(); f.Start();
+                    Assert(f.Dns.Callback(f.Dns.Generation, RuleTarget.Corporate, new[] { "192.0.2.91" }), "Initial DNS route failed.");
+                    DualResource route = f.Journal.Stored.Entries.Single(e => e.Resource.Destination == "192.0.2.91/32").Resource;
+                    f.Now = f.Now.AddSeconds(61);
+                    f.Platform.BeforeRead = delegate { f.Platform.BeforeRead = null; throw new DualReadUnavailableException("worker_timeout:send"); };
+                    Assert(!f.Dns.Callback(f.Dns.Generation, RuleTarget.Corporate, new[] { "192.0.2.91" }), "Timed out DNS answer escaped.");
+                    int writes = f.Platform.Writes;
+                    f.Platform.Values.Remove(Key(route));
+                    f.Now = f.Now.AddSeconds(5);
+                    Assert(!f.Runtime.ValidateCurrent().Success && f.Runtime.LastFailure.Code == "route_readback_changed" &&
+                        f.Platform.Writes == writes && !f.Platform.Values.ContainsKey(Key(route)), "Changed route was ignored or recreated.");
+                    f.AssertProtected();
+                });
+                Test("validation cannot acknowledge an unissued DNS route or a late read", delegate
+                {
+                    Fixture f = new Fixture(); f.Start();
+                    int writes = f.Platform.Writes;
+                    f.Platform.CaptureOverride = delegate { f.Platform.CaptureOverride = null; throw new DualReadUnavailableException("worker_timeout:send"); };
+                    Assert(!f.Dns.Callback(f.Dns.Generation, RuleTarget.Corporate, new[] { "192.0.2.90" }), "New destination accepted without proof.");
+                    f.Now = f.Now.AddSeconds(5);
+                    Assert(f.Runtime.ValidateCurrent().State == "ReadDeferred" && f.Platform.Writes == writes, "Background check created or accepted a new route.");
+                    f.Platform.CaptureOverride = delegate { f.Now = f.Now.AddSeconds(26); return f.Platform.Snapshot; };
+                    Assert(!f.Runtime.ValidateCurrent().Success && f.Runtime.LastFailure.Code == "read_verification_deadline" &&
+                        f.Runtime.LastFailure.Message.Contains("dns_capture/worker_timeout:send"), "Long capture overran the original bounded deadline.");
+                    f.AssertProtected();
                 });
                 Test("periodic route-read timeout retries the same audit before clearing deferred verification", delegate
                 {
@@ -773,6 +950,74 @@ namespace FastLinkDirectTool.Tests
                         else f.Platform.Snapshot.Adapters.RemoveAt(0);
                         Assert(!f.Runtime.Stop().Success && f.Runtime.IsActive && f.Platform.Writes == writes && f.Dns.Pauses == pauses && f.Journal.Saves == saves, "Unknown topology triggered cleanup.");
                     }
+                });
+                Test("explicit mode three Start resumes protected metrics on warm and cold owners", delegate
+                {
+                    foreach (bool cold in new[] { false, true })
+                    {
+                        Fixture f = ProtectedModeThree();
+                        string owner = f.Journal.Stored.Owner;
+                        long generation = f.Journal.Stored.Generation;
+                        if (cold) f.Runtime = new DualNetworkRuntime(f.Platform, f.Journal, f.Dns, delegate { return f.Now; });
+                        int oldMetricWrites = f.Platform.Calls.Count(c => c == "write:Metric4");
+                        Assert(f.Runtime.HasPending && !f.Runtime.Start(f.Request, false).Success && !f.Runtime.Arm(f.Request, true).Success,
+                            "pending protection accepted automatic Start/Arm");
+                        f.Start();
+                        Assert(!f.Runtime.HasPending && f.Runtime.IsActive && f.Journal.Stored.Owner == owner &&
+                            f.Journal.Stored.Generation > generation && f.Journal.Stored.Phase == "Running", "transaction not resumed");
+                        Assert(f.Platform.Calls.Count(c => c == "write:Metric4") == oldMetricWrites, "retry rewrote or restored egress");
+                        Assert(f.Journal.Stored.Entries.GroupBy(e => Key(e.Resource)).All(g => g.Count() == 1), "retry duplicated a journal key");
+                        int saves = f.Journal.Saves, writes = f.Platform.Writes;
+                        f.Start();
+                        Assert(f.Journal.Saves == saves && f.Platform.Writes == writes, "running Start was not idempotent");
+                        Assert(f.Runtime.Stop(true).Success, "original baselines could not be recovered");
+                        f.AssertClean();
+                        Assert(f.Platform.Values[Key(new DualResource { Kind = DualResourceKind.Metric4, InterfaceId = Corp })] == "automatic=1;metric=25" &&
+                            f.Platform.Values[Key(new DualResource { Kind = DualResourceKind.Metric4, InterfaceId = Internet })] == "automatic=1;metric=40",
+                            "original metric baselines lost");
+                    }
+                });
+                Test("mode three protected retry rejects conflicting policy, resources and evidence without writes", delegate
+                {
+                    foreach (string conflict in new[] { "tunnel", "admission", "reachability", "permission", "default", "ipv6", "thirdPartyDns", "residual", "partial", "foreignOwner", "metric", "role", "journalRace", "saveFailure" })
+                    {
+                        Fixture f = ProtectedModeThree();
+                        f.Runtime = new DualNetworkRuntime(f.Platform, f.Journal, f.Dns, delegate { return f.Now; });
+                        switch (conflict)
+                        {
+                            case "tunnel": f.Platform.Snapshot.TunnelActive = true; break;
+                            case "admission": f.Platform.Snapshot.CorporateAdmissionVerified = false; break;
+                            case "reachability": f.Platform.Snapshot.InternetReachabilityVerified = false; break;
+                            case "permission": f.Platform.Snapshot.DualConnectionAllowed = false; break;
+                            case "default": f.Platform.Snapshot.ExternalDefaultPreferred = false; break;
+                            case "ipv6": f.Platform.Snapshot.Adapters[0].HasIpv6Default = true; break;
+                            case "thirdPartyDns": f.Platform.Snapshot.OtherDnsPolicyPresent = true; break;
+                            case "residual":
+                                DualJournalEntry old = f.Journal.Stored.Entries.First(e => e.Resource.Kind == DualResourceKind.Route4);
+                                f.Platform.Values[Key(old.Resource)] = old.After; break;
+                            case "partial": f.Journal.Stored.Entries.First(e => e.Resource.Kind == DualResourceKind.Nrpt).Restored = false; break;
+                            case "foreignOwner": f.Journal.Stored.Scope += "-foreign"; break;
+                            case "metric": f.Platform.Values[Key(new DualResource { Kind = DualResourceKind.Metric4, InterfaceId = Internet })] = "automatic=0;metric=8"; break;
+                            case "role": f.Platform.Snapshot.Adapters[0].Kind = LinkKind.Ethernet; break;
+                            case "journalRace": f.Platform.BeforeRead = delegate { f.Journal.Stored.Generation++; f.Platform.BeforeRead = null; }; break;
+                            case "saveFailure": f.Journal.FailSaveAt = f.Journal.Saves + 1; break;
+                        }
+                        string fingerprint = DualJournalFingerprint.Compute(f.Journal.Stored);
+                        int writes = f.Platform.Writes, removes = f.Platform.Removes, starts = f.Dns.Starts;
+                        Assert(!f.Runtime.Start(f.Request, true).Success && f.Runtime.HasPending && !f.Dns.Running, "accepted " + conflict);
+                        Assert(f.Platform.Writes == writes && f.Platform.Removes == removes && f.Dns.Starts == starts, "changed network for " + conflict);
+                        Assert(conflict == "journalRace" || DualJournalFingerprint.Compute(f.Journal.Stored) == fingerprint, "lost original record for " + conflict);
+                    }
+                });
+                Test("failed resumed DNS start can retry again without accumulating stale resource keys", delegate
+                {
+                    Fixture f = ProtectedModeThree();
+                    int oldMetricWrites = f.Platform.Calls.Count(c => c == "write:Metric4");
+                    f.Dns.FailStart = true;
+                    Assert(!f.Runtime.Start(f.Request, true).Success, "failed resumed DNS accepted"); f.AssertProtected();
+                    f.Dns.FailStart = false; f.Start();
+                    Assert(f.Platform.Calls.Count(c => c == "write:Metric4") == oldMetricWrites, "failure touched egress");
+                    Assert(f.Runtime.Stop(true).Success, "failed retry left unrecoverable journal"); f.AssertClean();
                 });
                 Test("failed DNS start retains protection through repeated validation and restart", delegate
                 {

@@ -18,8 +18,8 @@ using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using System.Xml;
 
-[assembly: AssemblyVersion("2.6.8.0")]
-[assembly: AssemblyFileVersion("2.6.8.0")]
+[assembly: AssemblyVersion("2.6.10.0")]
+[assembly: AssemblyFileVersion("2.6.10.0")]
 
 namespace FastLinkDirectTool
 {

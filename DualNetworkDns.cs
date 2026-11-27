@@ -10,7 +10,7 @@ using System.Threading;
 
 namespace FastLinkDirectTool.Modes
 {
-    // Constructing this type does not bind a socket. Only the explicit Start call
+    // Constructing this type does not bind a socket. Only explicit StartPaused
     // may bind loopback port 53; the runtime must own and verify NRPT separately.
     public sealed class DualNetworkDns : IDualDnsService
     {
@@ -23,21 +23,18 @@ namespace FastLinkDirectTool.Modes
         private Socket udp;
         private TcpListener tcp;
         private volatile bool running;
-        private volatile bool paused = true;
-        private long epoch;
-        private DualDnsSession session;
+        private readonly DualDnsAdmission admission = new DualDnsAdmission();
 
         public bool IsRunning { get { return running; } }
 
-        public void Start(ModeRequest request, NetworkSnapshot snapshot, long generation,
+        public long StartPaused(ModeRequest request, NetworkSnapshot snapshot, long generation,
             Func<long, RuleTarget, string[], bool> routeCallback)
         {
             if (routeCallback == null) throw new ArgumentNullException("routeCallback");
             DualDnsSession next = DualDnsSession.Create(request, snapshot, generation, routeCallback);
             lock (lifecycle)
             {
-                paused = true;
-                Interlocked.Increment(ref epoch);
+                long activationToken = admission.StartPaused(next);
                 if (!running)
                 {
                     Socket newUdp = null;
@@ -60,6 +57,7 @@ namespace FastLinkDirectTool.Modes
                     }
                     catch
                     {
+                        admission.Pause();
                         running = false;
                         if (newUdp != null) newUdp.Close();
                         if (newTcp != null) newTcp.Stop();
@@ -67,18 +65,25 @@ namespace FastLinkDirectTool.Modes
                         throw;
                     }
                 }
-                session = next;
-                paused = false;
+                return activationToken;
             }
         }
 
-        // Deliberately nonblocking. The runtime must invalidate its generation
-        // under its own route-write lock BEFORE this call. Never hold our lock
-        // while invoking its callback: that would invert the runtime lock order.
+        // Activation is a CAS against the exact pending session. A concurrent
+        // Pause invalidates that ticket and can never be undone by a late Resume.
+        public bool Resume(long generation, long activationToken)
+        {
+            lock (lifecycle)
+                return running && admission.Resume(generation, activationToken);
+        }
+
+        // Immediately invalidate admission, then drain only a final socket send
+        // for at most 2.5 seconds. Never wait for upstream IO/route callbacks.
+        // The runtime invalidates its generation under its route lock first;
+        // send bookkeeping must never invoke that callback or acquire lifecycle.
         public void Pause()
         {
-            paused = true;
-            Interlocked.Increment(ref epoch);
+            admission.Pause();
         }
 
         // Call only after the owner has verified that no NRPT depends on us.
@@ -87,10 +92,10 @@ namespace FastLinkDirectTool.Modes
             Pause();
             lock (lifecycle)
             {
+                admission.Pause();
                 running = false;
                 if (udp != null) { udp.Close(); udp = null; }
                 if (tcp != null) { tcp.Stop(); tcp = null; }
-                session = null;
                 lock (clientsGate)
                 {
                     foreach (TcpClient client in clients) client.Close();
@@ -105,16 +110,13 @@ namespace FastLinkDirectTool.Modes
             thread.Start();
         }
 
-        private byte[] Process(byte[] query, bool clientTcp)
+        private byte[] Process(byte[] query, bool clientTcp, DualDnsAdmission.State captured)
         {
-            long capturedEpoch = Interlocked.Read(ref epoch);
-            DualDnsSession capturedSession = session;
             Func<bool> current = delegate
             {
-                return running && !paused && capturedSession != null &&
-                    object.ReferenceEquals(capturedSession, session) && Interlocked.Read(ref epoch) == capturedEpoch;
+                return running && admission.IsCurrent(captured);
             };
-            return DualDnsPacketProcessor.Handle(query, clientTcp, capturedSession, transport, current);
+            return DualDnsPacketProcessor.Handle(query, clientTcp, captured == null ? null : captured.Session, transport, current);
         }
 
         private void UdpLoop(Socket listener)
@@ -126,11 +128,14 @@ namespace FastLinkDirectTool.Modes
                     byte[] buffer = new byte[DualDnsPacket.MaximumPacketLength + 1];
                     EndPoint endpoint = new IPEndPoint(IPAddress.Any, 0);
                     int count = listener.ReceiveFrom(buffer, ref endpoint);
+                    // Bind the packet to admission at receipt, never when a
+                    // delayed thread-pool work item eventually begins running.
+                    DualDnsAdmission.State captured = admission.Capture();
                     IPEndPoint peer = endpoint as IPEndPoint;
                     if (peer == null || !IPAddress.IsLoopback(peer.Address)) continue;
                     byte[] query = new byte[count];
                     Buffer.BlockCopy(buffer, 0, query, 0, count);
-                    if (!slots.Wait(0))
+                    if (!admission.IsCurrent(captured) || !slots.Wait(0))
                     {
                         byte[] busy = DualDnsPacket.Error(query, 2);
                         listener.SendTo(busy, peer);
@@ -140,10 +145,11 @@ namespace FastLinkDirectTool.Modes
                     {
                         try
                         {
-                            long responseEpoch = Interlocked.Read(ref epoch);
-                            byte[] reply = Process(query, false);
-                            if (paused || responseEpoch != Interlocked.Read(ref epoch)) reply = DualDnsPacket.Error(query, 2);
-                            if (running && object.ReferenceEquals(listener, udp)) listener.SendTo(reply, peer);
+                            byte[] reply = Process(query, false, captured);
+                            admission.TrySend(captured, delegate
+                            {
+                                if (running && object.ReferenceEquals(listener, udp)) listener.SendTo(reply, peer);
+                            });
                         }
                         catch { /* Never let a client packet terminate the listener. */ }
                         finally { slots.Release(); }
@@ -162,8 +168,11 @@ namespace FastLinkDirectTool.Modes
                 try { client = listener.AcceptTcpClient(); }
                 catch (SocketException) { if (!running || !object.ReferenceEquals(listener, tcp)) return; else continue; }
                 catch (ObjectDisposedException) { return; }
+                // A connection accepted while paused cannot inherit a later
+                // session while waiting for its worker or complete query frame.
+                DualDnsAdmission.State captured = admission.Capture();
                 IPEndPoint peer = client.Client.RemoteEndPoint as IPEndPoint;
-                if (peer == null || !IPAddress.IsLoopback(peer.Address) || !slots.Wait(0)) { client.Close(); continue; }
+                if (peer == null || !IPAddress.IsLoopback(peer.Address) || !admission.IsCurrent(captured) || !slots.Wait(0)) { client.Close(); continue; }
                 lock (clientsGate)
                 {
                     if (!running || !object.ReferenceEquals(listener, tcp)) { client.Close(); slots.Release(); continue; }
@@ -180,18 +189,105 @@ namespace FastLinkDirectTool.Modes
                         int length = DualDnsPacket.U16(prefix, 0);
                         if (length < 12 || length > DualDnsPacket.MaximumPacketLength) return;
                         byte[] query = DualDnsPacket.ReadExact(stream, length, readBudget, 2000);
-                        long responseEpoch = Interlocked.Read(ref epoch);
-                        byte[] reply = Process(query, true);
-                        if (paused || responseEpoch != Interlocked.Read(ref epoch)) reply = DualDnsPacket.Error(query, 2);
-                        if (!running || !object.ReferenceEquals(listener, tcp)) return;
-                        byte[] framing = { (byte)(reply.Length >> 8), (byte)reply.Length };
-                        stream.Write(framing, 0, 2); stream.Write(reply, 0, reply.Length);
+                        byte[] reply = Process(query, true, captured);
+                        byte[] framing = new byte[reply.Length + 2];
+                        framing[0] = (byte)(reply.Length >> 8); framing[1] = (byte)reply.Length;
+                        Buffer.BlockCopy(reply, 0, framing, 2, reply.Length);
+                        admission.TrySend(captured, delegate
+                        {
+                            // One write shares the existing 2 s send timeout;
+                            // never hold this gate while reading or routing.
+                            if (running && object.ReferenceEquals(listener, tcp)) stream.Write(framing, 0, framing.Length);
+                        });
                     }
                     catch { }
                     finally { lock (clientsGate) { clients.Remove(client); } client.Close(); slots.Release(); }
                 })) { lock (clientsGate) { clients.Remove(client); } client.Close(); slots.Release(); }
             }
         }
+    }
+
+    // Pure in-memory admission state, independently testable without binding DNS.
+    // Immutable states also keep packets captured before Resume/Pause/replacement
+    // invalid: they cannot inherit a later session's permission to return answers.
+    internal sealed class DualDnsAdmission
+    {
+        internal sealed class State
+        {
+            internal readonly DualDnsSession Session;
+            internal readonly long Token;
+            internal readonly bool Open;
+            internal State(DualDnsSession session, long token, bool open)
+            { Session = session; Token = token; Open = open; }
+        }
+        private State state;
+        private long nextToken;
+        private readonly object sendGate = new object();
+        private int sendsInFlight;
+        internal State Capture() { return Interlocked.CompareExchange(ref state, null, null); }
+        internal long StartPaused(DualDnsSession session)
+        {
+            if (session == null) throw new ArgumentNullException("session");
+            long token = Interlocked.Increment(ref nextToken);
+            State pending = new State(session, token, false);
+            // Publish a closed ticket before draining. A concurrent Pause or
+            // replacement can cancel it and cannot be overwritten afterwards.
+            Interlocked.Exchange(ref state, pending);
+            try { DrainFinalSends(2500); }
+            catch { Interlocked.CompareExchange(ref state, null, pending); throw; }
+            if (!object.ReferenceEquals(Capture(), pending))
+                throw new InvalidOperationException("DNS 启动已被暂停或替换，未激活查询。");
+            return token;
+        }
+        internal bool Resume(long generation, long token)
+        {
+            State pending = Capture();
+            if (pending == null || pending.Open || pending.Token != token || pending.Session.Generation != generation) return false;
+            State ready = new State(pending.Session, pending.Token, true);
+            return object.ReferenceEquals(Interlocked.CompareExchange(ref state, ready, pending), pending);
+        }
+        internal void Pause(int timeoutMilliseconds = 2500)
+        {
+            Interlocked.Exchange(ref state, null);
+            DrainFinalSends(timeoutMilliseconds);
+        }
+        private void DrainFinalSends(int timeoutMilliseconds)
+        {
+            if (timeoutMilliseconds < 0 || timeoutMilliseconds > 2500) throw new ArgumentOutOfRangeException("timeoutMilliseconds");
+            Stopwatch budget = Stopwatch.StartNew();
+            if (!Monitor.TryEnter(sendGate, timeoutMilliseconds))
+                throw new TimeoutException("DNS 最终发送尚未排空；保留监听器和依赖规则，等待手动清理。");
+            try
+            {
+                while (sendsInFlight != 0)
+                {
+                    int remaining = timeoutMilliseconds - (int)budget.ElapsedMilliseconds;
+                    if (remaining <= 0 || (!Monitor.Wait(sendGate, remaining) && sendsInFlight != 0))
+                        throw new TimeoutException("DNS 最终发送尚未排空；保留监听器和依赖规则，等待手动清理。");
+                }
+            }
+            finally { Monitor.Exit(sendGate); }
+        }
+        // The short lock linearizes admission with the in-flight count, not the
+        // socket IO. Normal sends remain concurrent (the listener caps them at
+        // 48); a slow TCP peer cannot hold up other UDP replies. This delegate
+        // must contain only the bounded final write, never upstream/route work.
+        internal bool TrySend(State captured, Action send)
+        {
+            if (send == null) throw new ArgumentNullException("send");
+            lock (sendGate)
+            {
+                if (!IsCurrent(captured)) return false;
+                sendsInFlight++;
+            }
+            try
+            {
+                send(); return true;
+            }
+            finally { lock (sendGate) { sendsInFlight--; Monitor.PulseAll(sendGate); } }
+        }
+        internal bool IsCurrent(State captured)
+        { return captured != null && captured.Open && object.ReferenceEquals(captured, Capture()); }
     }
 
     // Injectable transport; tests never instantiate or open real sockets.
@@ -295,17 +391,27 @@ namespace FastLinkDirectTool.Modes
             try { question = DualDnsPacket.ReadQuery(packet); }
             catch { return DualDnsPacket.Error(packet, 1); }
             if (session == null || transport == null || current == null || !current()) return DualDnsPacket.Reply(question, null, 2, false);
-            // IPv4-only v1. No AAAA / HTTPS / SVCB, independent CNAME queries,
-            // SRV or arbitrary record-type forwarding can escape the A-route gate.
+            // SRV discovery returns names only. Subsequent A lookups still go
+            // through the ordinary verified route gate on the corporate adapter.
             if (question.Type == 28 || question.Type == 64 || question.Type == 65)
                 return DualDnsPacket.Reply(question, null, 0, false);
-            if (question.Type != 1) return DualDnsPacket.Reply(question, null, 5, false);
+            bool serviceLookup = question.Type == 33;
+            if (serviceLookup)
+            {
+                string[] labels = question.Name.Split('.');
+                if (labels.Length < 4 || !labels[0].StartsWith("_", StringComparison.Ordinal) || labels[0].Length < 2 ||
+                    !(string.Equals(labels[1], "_tcp", StringComparison.OrdinalIgnoreCase) || string.Equals(labels[1], "_udp", StringComparison.OrdinalIgnoreCase)))
+                    return DualDnsPacket.Reply(question, null, 5, false);
+            }
+            else if (question.Type != 1) return DualDnsPacket.Reply(question, null, 5, false);
             IPAddress literal;
             string classificationAddress = IPAddress.TryParse(question.Name, out literal) ? literal.ToString() : "203.0.113.254";
             // Synthetic address is solely for selecting the rule target. Never
             // returned, sent to a server, or used in the actual route callback.
             RouteDecision classification = RuleRouter.Decide(session.Request.Rules, question.Name, new List<string> { classificationAddress });
             if (classification.Blocked) return DualDnsPacket.Reply(question, null, 2, false);
+            if (serviceLookup && classification.Target != RuleTarget.Corporate)
+                return DualDnsPacket.Reply(question, null, 5, false);
             string id = classification.Target == RuleTarget.Corporate ? session.Request.CorporateAdapterId : session.Request.InternetAdapterId;
             AdapterSnapshot adapter = session.Snapshot.Adapters.Single(delegate(AdapterSnapshot a) { return a != null && string.Equals(a.Id, id, StringComparison.OrdinalIgnoreCase); });
             byte[] query = DualDnsPacket.Query(question);
@@ -330,6 +436,20 @@ namespace FastLinkDirectTool.Modes
                     if (!current()) break;
                     if (answer.Rcode != 0 && answer.Rcode != 3) continue;
                     if (answer.Rcode == 3) return DualDnsPacket.Reply(question, null, 3, false);
+                    if (serviceLookup)
+                    {
+                        foreach (DualDnsRecord record in answer.Records)
+                        {
+                            if (record.ServiceHost.Length == 0) continue; // DNS root means service unavailable.
+                            IPAddress numeric;
+                            RouteDecision target = RuleRouter.Decide(session.Request.Rules, record.ServiceHost, new List<string> { classificationAddress });
+                            if (IPAddress.TryParse(record.ServiceHost, out numeric) || target.Blocked || target.Target != RuleTarget.Corporate)
+                                return DualDnsPacket.Reply(question, null, 2, false);
+                        }
+                        byte[] serviceReply = DualDnsPacket.Reply(question, answer.Records, 0, false);
+                        if (!current()) return DualDnsPacket.Reply(question, null, 2, false);
+                        return !clientTcp && serviceReply.Length > 512 ? DualDnsPacket.Reply(question, null, 0, true) : serviceReply;
+                    }
                     if (answer.Addresses.Count == 0) return DualDnsPacket.Reply(question, null, 0, false);
                     RouteDecision routed = RuleRouter.Decide(session.Request.Rules, question.Name, answer.Addresses, session.Request, session.Snapshot);
                     if (routed.Blocked || routed.Target != classification.Target) return DualDnsPacket.Reply(question, null, 2, false);
@@ -363,7 +483,8 @@ namespace FastLinkDirectTool.Modes
     }
     internal sealed class DualDnsRecord
     {
-        internal string Owner, Alias, Address;
+        internal string Owner, Alias, Address, ServiceHost;
+        internal ushort Priority, Weight, Port;
         internal ushort Type;
         internal uint Ttl;
     }
@@ -444,6 +565,7 @@ namespace FastLinkDirectTool.Modes
 
         private static void WriteName(Stream stream, string name)
         {
+            if (name.Length == 0) { stream.WriteByte(0); return; }
             foreach (string label in name.Split('.'))
             {
                 byte[] bytes = Encoding.ASCII.GetBytes(label);
@@ -516,12 +638,24 @@ namespace FastLinkDirectTool.Modes
                     if (position != end || rr.Alias.Length == 0) throw new InvalidDataException("Invalid CNAME data.");
                 }
                 else if (type == 28 && length != 16) throw new InvalidDataException("Invalid AAAA length.");
-                if (index < answers && recordClass == 1 && (type == 1 || type == 5)) records.Add(rr);
+                if (index < answers && recordClass == 1)
+                {
+                    if (expected.Type == 33 && type == 33 && string.Equals(owner, expected.Name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (length < 7) throw new InvalidDataException("Short SRV data.");
+                        rr.Priority = U16(packet, offset); rr.Weight = U16(packet, offset + 2); rr.Port = U16(packet, offset + 4);
+                        int position = offset + 6; rr.ServiceHost = Name(packet, ref position);
+                        if (position != end) throw new InvalidDataException("Invalid SRV target.");
+                        records.Add(rr);
+                    }
+                    else if (expected.Type != 33 && (type == 1 || type == 5)) records.Add(rr);
+                }
                 offset = end;
             }
             if (offset != packet.Length) throw new InvalidDataException("Trailing DNS response data.");
             DualDnsAnswer result = new DualDnsAnswer { Rcode = U16(packet, 2) & 15 };
             if (result.Rcode != 0) return result;
+            if (expected.Type == 33) { result.Records = records; return result; }
             string current = expected.Name; HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             for (int hop = 0; hop <= 16; hop++)
             {
@@ -567,11 +701,22 @@ namespace FastLinkDirectTool.Modes
                 WriteName(stream, question.Name); W16(stream, question.Type); W16(stream, question.Class);
                 foreach (DualDnsRecord rr in records ?? new List<DualDnsRecord>())
                 {
-                    WriteName(stream, rr.Owner); W16(stream, rr.Type); W16(stream, 1); W32(stream, Math.Min(rr.Ttl, MaximumTtl));
+                    if (rr.Type == 33 && string.Equals(rr.Owner, question.Name, StringComparison.OrdinalIgnoreCase)) W16(stream, 0xC00C);
+                    else WriteName(stream, rr.Owner);
+                    W16(stream, rr.Type); W16(stream, 1); W32(stream, Math.Min(rr.Ttl, MaximumTtl));
                     if (rr.Type == 1) { W16(stream, 4); byte[] bytes = IPAddress.Parse(rr.Address).GetAddressBytes(); stream.Write(bytes, 0, bytes.Length); }
                     else if (rr.Type == 5)
                     {
                         using (MemoryStream name = new MemoryStream()) { WriteName(name, rr.Alias); byte[] bytes = name.ToArray(); W16(stream, bytes.Length); stream.Write(bytes, 0, bytes.Length); }
+                    }
+                    else if (rr.Type == 33)
+                    {
+                        using (MemoryStream name = new MemoryStream())
+                        {
+                            WriteName(name, rr.ServiceHost); byte[] bytes = name.ToArray();
+                            W16(stream, 6 + bytes.Length); W16(stream, rr.Priority); W16(stream, rr.Weight); W16(stream, rr.Port);
+                            stream.Write(bytes, 0, bytes.Length);
+                        }
                     }
                     else throw new InvalidDataException("Unsupported response record.");
                 }

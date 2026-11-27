@@ -233,6 +233,106 @@ namespace FastLinkDirectTool.Tests
             { string s=DualNetworkWindowsPlatform.BuildCaptureScript(new[]{Owner});Assert(s.Contains("$policy.NameServers")&&s.Contains("$effectiveServers.Count -eq 1")&&s.Contains("$effectiveServers[0] -ceq '127.0.0.1'")&&s.Contains("-or -not $effectiveOwned"),"effective GPO resolver can hide behind local marker"); });
             Test("snapshot timeout is not an empty successful network", delegate { Fake f=new Fake();f.Results.Enqueue(new DualCommandResult{TimedOut=true});Throws(delegate{f.Platform.Capture();}); });
             Test("command failure is not absence", delegate { Fake f=new Fake();f.Results.Enqueue(new DualCommandResult{ExitCode=1});Throws(delegate{f.Platform.Read(Nrpt());}); });
+            Test("pure NRPT read enumerates once and retains final ambiguity check", delegate
+            {
+                Fake f=new Fake();f.Results.Enqueue(Value(null));f.Platform.Read(Nrpt());string s=f.Commands.Last();
+                Assert(s.Split(new[]{"$r=@(Read-Nrpt);"},StringSplitOptions.None).Length==2,"read duplicated enumeration");
+                Assert(s.Contains("if($r.Count -gt 1){throw 'ambiguous_nrpt_namespace'};$v=$null"),"final ambiguity check lost");
+                Assert(!s.Contains("Add-DnsClient")&&!s.Contains("Remove-DnsClient"),"read mutated DNS policy");
+            });
+            Test("pure route read enumerates once and preserves competing path and identity checks", delegate
+            {
+                Fake f=new Fake();f.Capture();f.Results.Enqueue(Value(null));f.Platform.Read(Route("192.0.2.1","10.20.0.50/32"));string s=f.Commands.Last();
+                Assert(s.Split(new[]{"$r=@(Read-Routes);"},StringSplitOptions.None).Length==2,"read duplicated enumeration");
+                Assert(s.Contains("conflicting_destination_route")&&s.Contains("physical_identity_unverified")&&s.Contains("ambiguous_exact_route"),"read guard weakened");
+                Assert(!s.Contains("New-NetRoute")&&!s.Contains("Remove-NetRoute"),"read mutated routes");
+            });
+            Test("NRPT and route mutations retain both before and after observations", delegate
+            {
+                foreach(bool nrpt in new[]{true,false})foreach(string op in new[]{"write","remove"})
+                {
+                    Fake f=new Fake();f.Capture();DualResource r=nrpt?Nrpt():Route("192.0.2.1","10.20.0.50/32");
+                    string value=nrpt?"server=127.0.0.1;owner="+Owner:"metric=1";
+                    f.Results.Enqueue(Value(op=="write"?null:value));f.Platform.Read(r);
+                    string s=f.Platform.BuildResourceScript(r,op,op=="write"?value:null);scripts.Add(s);
+                    string read=nrpt?"$r=@(Read-Nrpt);":"$r=@(Read-Routes);";
+                    Assert(s.Split(new[]{read},StringSplitOptions.None).Length==3,"mutation lost before/after observation");
+                }
+            });
+            Test("timing batches successful commands with no target data", delegate
+            {
+                long now=0;var events=new List<IDictionary<string,object>>();
+                var t=new DualCommandTiming(delegate(IDictionary<string,object> e){events.Add(e);},delegate{return now;});
+                t.Observe("read.Nrpt",12,true,false);now=29999;t.Observe("read.Route4",20,true,false);
+                Assert(events.Count==0,"success logged per command");now=30000;t.Observe("capture",30,true,false);
+                Assert(events.Count==1&&(int)events[0]["command_count"]==3&&(long)events[0]["command_total_ms"]==62,"bad window totals");
+                Assert(events[0].Count==9&&!events[0].ContainsKey("script")&&!events[0].ContainsKey("error"),"unsafe timing fields");
+                Assert((string)events[0]["command_max_operation"]=="capture"&&((Dictionary<string,long>)events[0]["operation_total_ms"])["read.Nrpt"]==12,"per-operation cost missing");
+            });
+            Test("timing failure reporting is bounded and unknown operation text is discarded", delegate
+            {
+                long now=0;var events=new List<IDictionary<string,object>>();
+                var t=new DualCommandTiming(delegate(IDictionary<string,object> e){events.Add(e);},delegate{return now;});
+                for(int i=0;i<100;i++)t.Observe("sensitive text must not be retained",5,false,true);
+                Assert(events.Count==1,"failure logging flooded");now=5000;t.Observe("read.Nrpt",10,false,true);
+                Assert(events.Count==2&&(int)events[1]["timeout_count"]==100,"throttled failures disappeared");
+                Assert(!new JavaScriptSerializer().Serialize(events).Contains("sensitive"),"untrusted text logged");
+            });
+            Test("timing sink failure never changes command result", delegate
+            {
+                var t=new DualCommandTiming(delegate(IDictionary<string,object> e){throw new Exception("sink offline");},delegate{return 1L;});
+                t.Observe("capture",100,false,true);
+                var p=new DualNetworkWindowsPlatform(delegate(string s,int timeout){return Value(null);},delegate{return true;},delegate{return DateTime.UtcNow;},"fixture",
+                    delegate(IDictionary<string,object> e){throw new Exception("sink offline");});
+                Assert(p.Read(Nrpt())==null,"observer changed result");
+            });
+            Test("malformed command output is counted as unverified without exporting text", delegate
+            {
+                var events=new List<IDictionary<string,object>>();
+                var observed=new System.Threading.ManualResetEventSlim(false);
+                var p=new DualNetworkWindowsPlatform(delegate(string s,int timeout){return new DualCommandResult{Output="private malformed body"};},delegate{return true;},delegate{return DateTime.UtcNow;},"fixture",
+                    delegate(IDictionary<string,object> e){events.Add(e);observed.Set();});
+                Throws(delegate{p.Read(Nrpt());});Assert(observed.Wait(2000)&&events.Count==1&&(int)events[0]["command_response_error_count"]==1,"invalid response counted successful");
+                Assert(!new JavaScriptSerializer().Serialize(events).Contains("private"),"raw command output retained");
+                observed.Dispose();
+            });
+            Test("blocking diagnostic sink never blocks platform and has one bounded publish slot", delegate
+            {
+                using(var entered=new System.Threading.ManualResetEventSlim(false))
+                using(var release=new System.Threading.ManualResetEventSlim(false))
+                using(var done=new System.Threading.ManualResetEventSlim(false))
+                {
+                    int calls=0;
+                    var publisher=new DualTimingPublisher(delegate(IDictionary<string,object> e)
+                    {System.Threading.Interlocked.Increment(ref calls);entered.Set();release.Wait();done.Set();});
+                    try
+                    {
+                        publisher.Post(new Dictionary<string,object>());Assert(entered.Wait(2000),"fixture sink did not start");
+                        var timer=System.Diagnostics.Stopwatch.StartNew();
+                        for(int i=0;i<1000;i++)publisher.Post(new Dictionary<string,object>());
+                        Assert(timer.ElapsedMilliseconds<1000&&calls==1,"blocked sink queued unbounded work or blocked caller");
+                    }
+                    finally{release.Set();Assert(done.Wait(2000),"fixture sink did not drain");}
+                }
+            });
+            Test("platform command returns while its diagnostic writer is blocked", delegate
+            {
+                using(var entered=new System.Threading.ManualResetEventSlim(false))
+                using(var release=new System.Threading.ManualResetEventSlim(false))
+                using(var done=new System.Threading.ManualResetEventSlim(false))
+                {
+                    var p=new DualNetworkWindowsPlatform(delegate(string s,int timeout){return new DualCommandResult{ExitCode=1};},delegate{return true;},delegate{return DateTime.UtcNow;},"fixture",
+                        delegate(IDictionary<string,object> e){entered.Set();release.Wait();done.Set();});
+                    try
+                    {
+                        var first=System.Threading.Tasks.Task.Factory.StartNew(delegate{Throws(delegate{p.Read(Nrpt());});});
+                        Assert(first.Wait(2000)&&entered.Wait(2000),"diagnostics blocked command completion");
+                        var next=System.Threading.Tasks.Task.Factory.StartNew(delegate{Throws(delegate{p.Read(Nrpt());});});
+                        Assert(next.Wait(2000),"platform lock stuck behind logger");
+                    }
+                    finally{release.Set();Assert(done.Wait(2000),"fixture sink did not drain");}
+                }
+            });
             Test("missing or duplicate completion marker rejected", delegate
             { Fake f=new Fake();f.Results.Enqueue(new DualCommandResult{Output="{}"});Throws(delegate{f.Platform.Capture();});f.Results.Enqueue(new DualCommandResult{Output="DUAL_JSON:{}\nDUAL_JSON:{}"});Throws(delegate{f.Platform.Capture();}); });
             Test("administrator failure performs no command or escalation", delegate

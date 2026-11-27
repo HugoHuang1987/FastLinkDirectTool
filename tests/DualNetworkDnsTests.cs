@@ -4,11 +4,12 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using FastLinkDirectTool.Modes;
 
 namespace FastLinkDirectTool.Tests
 {
-    // Packet-only fixtures. Do not construct DualNetworkDns or call Start here.
+    // Packet/admission-only fixtures. Never bind a production DNS listener.
     internal static class DualNetworkDnsTests
     {
         private static int count;
@@ -99,6 +100,14 @@ namespace FastLinkDirectTool.Tests
         { return new Record { Owner = owner, Data = ip.Split('.').Select(byte.Parse).ToArray() }; }
         private static Record Cname(string owner, string alias)
         { return new Record { Owner = owner, Type = 5, Data = NameBytes(alias) }; }
+        private static Record Service(string owner, string target)
+        {
+            using (MemoryStream s = new MemoryStream())
+            {
+                W16(s, 10); W16(s, 20); W16(s, 389); Name(s, target);
+                return new Record { Owner = owner, Type = 33, Data = s.ToArray() };
+            }
+        }
         private static byte[] Query(string name = CompanyHost, ushort type = 1)
         {
             using (MemoryStream s = new MemoryStream())
@@ -128,9 +137,194 @@ namespace FastLinkDirectTool.Tests
         { byte[] reply = h.Handle(query); Require(Rcode(reply) == code && h.Routes == 0 && DualDnsPacket.U16(reply, 6) == 0, "Unsafe packet was not rejected before route callback."); }
         private static void RejectPacket(Action body)
         { bool rejected = false; try { body(); } catch (InvalidDataException) { rejected = true; } Require(rejected, "Malformed packet accepted."); }
+        private static byte[] Admitted(Harness h, DualDnsAdmission admission, byte[] query, bool tcp = false)
+        {
+            DualDnsAdmission.State captured = admission.Capture();
+            return DualDnsPacketProcessor.Handle(query, tcp, captured == null ? null : captured.Session, h.Transport,
+                delegate { return admission.IsCurrent(captured); });
+        }
 
         internal static void Run(Action<string, Action> test)
         {
+            test("pending admission rejects A and SRV over UDP and TCP before upstream or route work", delegate
+            {
+                Harness h = new Harness(); DualDnsAdmission admission = new DualDnsAdmission(); admission.StartPaused(h.Session);
+                Stopwatch elapsed = Stopwatch.StartNew();
+                foreach (bool tcp in new[] { false, true }) foreach (ushort type in new ushort[] { 1, 33 })
+                {
+                    byte[] reply = Admitted(h, admission, Query(type == 33 ? "_ldap._tcp.corp.example.test" : CompanyHost, type), tcp);
+                    Require(Rcode(reply) == 2 && DualDnsPacket.U16(reply, 6) == 0, "Pending admission returned an answer.");
+                }
+                Require(h.Transport.Calls.Count == 0 && h.Routes == 0 && elapsed.ElapsedMilliseconds < 1000, "Pending admission blocked or touched upstream/routes.");
+            });
+            test("activation requires both exact generation and unique session ticket", delegate
+            {
+                Harness h = new Harness(); DualDnsAdmission admission = new DualDnsAdmission(); long first = admission.StartPaused(h.Session);
+                Require(!admission.Resume(74, first) && !admission.Resume(73, first + 1), "Wrong generation or token activated DNS.");
+                long second = admission.StartPaused(h.Session);
+                Require(second != first && !admission.Resume(73, first), "Old startup activated a replacement session.");
+                Require(admission.Resume(73, second) && !admission.Resume(73, second), "Activation did not consume its ticket exactly once.");
+                Require(Rcode(Admitted(h, admission, Query())) == 0 && h.Routes == 1, "Ready DNS bypassed or lost the actual route callback.");
+            });
+            test("a packet captured while pending cannot inherit later activation", delegate
+            {
+                Harness h = new Harness(); DualDnsAdmission admission = new DualDnsAdmission(); long token = admission.StartPaused(h.Session);
+                DualDnsAdmission.State before = admission.Capture(); Require(admission.Resume(73, token), "Fixture activation failed.");
+                byte[] reply = DualDnsPacketProcessor.Handle(Query(), false, before.Session, h.Transport, delegate { return admission.IsCurrent(before); });
+                Require(Rcode(reply) == 2 && h.Transport.Calls.Count == 0 && h.Routes == 0, "Pending packet inherited readiness.");
+            });
+            test("Pause invalidates pending activation and active packet tickets", delegate
+            {
+                Harness h = new Harness(); DualDnsAdmission admission = new DualDnsAdmission(); long token = admission.StartPaused(h.Session);
+                admission.Pause(); Require(!admission.Resume(73, token), "Pause was undone by a late activation.");
+                token = admission.StartPaused(h.Session); Require(admission.Resume(73, token), "Fixture activation failed.");
+                DualDnsAdmission.State active = admission.Capture(); admission.Pause();
+                Require(!admission.IsCurrent(active) && !admission.Resume(73, token), "Pause preserved an active/consumed ticket.");
+                Require(Rcode(Admitted(h, admission, Query())) == 2 && h.Transport.Calls.Count == 0, "Paused DNS reached upstream.");
+            });
+            test("late A and SRV upstream replies cannot cross session replacement", delegate
+            {
+                foreach (ushort type in new ushort[] { 1, 33 })
+                {
+                    Harness h = new Harness(); DualDnsAdmission admission = new DualDnsAdmission(); long token = admission.StartPaused(h.Session);
+                    Require(admission.Resume(73, token), "Fixture activation failed."); string host = type == 33 ? "_ldap._tcp.corp.example.test" : CompanyHost;
+                    h.Transport.Handler = delegate(byte[] q, Call c)
+                    {
+                        admission.Pause(); h.Rebuild(); long next = admission.StartPaused(h.Session); Require(admission.Resume(73, next), "Replacement failed.");
+                        return Answer(q, new[] { type == 33 ? Service(host, CompanyHost) : A(host, "10.20.30.40") });
+                    };
+                    byte[] reply = Admitted(h, admission, Query(host, type));
+                    Require(Rcode(reply) == 2 && h.Routes == 0 && DualDnsPacket.U16(reply, 6) == 0, "Late upstream reply crossed the session boundary.");
+                }
+            });
+            test("Pause racing Resume always leaves admission closed", delegate
+            {
+                for (int i = 0; i < 24; i++)
+                {
+                    Harness h = new Harness(); DualDnsAdmission admission = new DualDnsAdmission(); long token = admission.StartPaused(h.Session);
+                    using (ManualResetEvent gate = new ManualResetEvent(false))
+                    {
+                        Thread resume = new Thread(delegate() { gate.WaitOne(); admission.Resume(73, token); });
+                        Thread pause = new Thread(delegate() { gate.WaitOne(); admission.Pause(); });
+                        resume.Start(); pause.Start(); gate.Set();
+                        Require(resume.Join(2000) && pause.Join(2000), "Admission transition blocked.");
+                    }
+                    Require(!admission.IsCurrent(admission.Capture()) && !admission.Resume(73, token), "Resume resurrected a paused ticket.");
+                }
+            });
+            test("queued packets retain receipt admission across Resume and session replacement", delegate
+            {
+                foreach (bool initiallyOpen in new[] { false, true })
+                {
+                    Harness h = new Harness(); DualDnsAdmission admission = new DualDnsAdmission(); long token = admission.StartPaused(h.Session);
+                    if (initiallyOpen) Require(admission.Resume(73, token), "Fixture activation failed.");
+                    DualDnsAdmission.State atReceipt = admission.Capture(); byte[] reply = null;
+                    using (ManualResetEvent queued = new ManualResetEvent(false)) using (ManualResetEvent release = new ManualResetEvent(false))
+                    {
+                        Thread worker = new Thread(delegate()
+                        {
+                            queued.Set(); release.WaitOne();
+                            reply = DualDnsPacketProcessor.Handle(Query(), false, atReceipt.Session, h.Transport, delegate { return admission.IsCurrent(atReceipt); });
+                        });
+                        worker.Start(); Require(queued.WaitOne(2000), "Worker was not queued.");
+                        if (initiallyOpen) token = admission.StartPaused(h.Session);
+                        Require(admission.Resume(73, token), "Later activation failed."); release.Set(); Require(worker.Join(2000), "Queued packet blocked.");
+                    }
+                    Require(Rcode(reply) == 2 && h.Routes == 0 && h.Transport.Calls.Count == 0, "Queued packet inherited a later admission state.");
+                }
+            });
+            test("Pause after final-send validation drains that send before returning", delegate
+            {
+                Harness h = new Harness(); DualDnsAdmission admission = new DualDnsAdmission(); long token = admission.StartPaused(h.Session);
+                Require(admission.Resume(73, token), "Fixture activation failed."); DualDnsAdmission.State captured = admission.Capture();
+                int sends = 0; Exception pauseError = null;
+                using (ManualResetEvent entered = new ManualResetEvent(false)) using (ManualResetEvent release = new ManualResetEvent(false)) using (ManualResetEvent paused = new ManualResetEvent(false))
+                {
+                    Thread sender = new Thread(delegate() { admission.TrySend(captured, delegate { entered.Set(); release.WaitOne(); Interlocked.Increment(ref sends); }); });
+                    Thread pauser = new Thread(delegate() { try { admission.Pause(); } catch (Exception e) { pauseError = e; } finally { paused.Set(); } });
+                    sender.Start(); Require(entered.WaitOne(2000), "Sender did not enter its final-send gate."); pauser.Start();
+                    try
+                    {
+                        Require(SpinWait.SpinUntil(delegate { return admission.Capture() == null; }, 1000), "Pause did not invalidate admission immediately.");
+                        Require(!paused.WaitOne(0), "Pause returned before the already-entered send completed.");
+                        Require(!admission.TrySend(captured, delegate { Interlocked.Increment(ref sends); }), "Concurrent send queued behind blocked output.");
+                    }
+                    finally { release.Set(); Require(sender.Join(2000) && pauser.Join(2000), "Send/pause workers blocked."); }
+                    Require(paused.WaitOne(0) && pauseError == null && sends == 1, "Pause did not linearize after its in-flight send.");
+                    Require(!admission.TrySend(captured, delegate { sends++; }) && sends == 1, "Old answer sent after Pause returned.");
+                }
+            });
+            test("send drain timeout fails closed without admitting another answer", delegate
+            {
+                Harness h = new Harness(); DualDnsAdmission admission = new DualDnsAdmission(); long token = admission.StartPaused(h.Session);
+                Require(admission.Resume(73, token), "Fixture activation failed."); DualDnsAdmission.State captured = admission.Capture();
+                using (ManualResetEvent entered = new ManualResetEvent(false)) using (ManualResetEvent release = new ManualResetEvent(false))
+                {
+                    Thread sender = new Thread(delegate() { admission.TrySend(captured, delegate { entered.Set(); release.WaitOne(); }); });
+                    sender.Start(); Require(entered.WaitOne(2000), "Sender did not enter gate."); bool timeout = false; Stopwatch elapsed = Stopwatch.StartNew();
+                    try { admission.Pause(25); } catch (TimeoutException) { timeout = true; }
+                    finally { release.Set(); Require(sender.Join(2000), "Sender did not finish."); }
+                    Require(timeout && elapsed.ElapsedMilliseconds < 1000 && !admission.IsCurrent(captured) && !admission.Resume(73, token), "Drain timeout reopened or waited without bound.");
+                }
+            });
+            test("StartPaused cannot replace a session before its final send drains", delegate
+            {
+                Harness h = new Harness(); DualDnsAdmission admission = new DualDnsAdmission(); long token = admission.StartPaused(h.Session);
+                Require(admission.Resume(73, token), "Fixture activation failed."); DualDnsAdmission.State captured = admission.Capture(); long next = 0;
+                using (ManualResetEvent entered = new ManualResetEvent(false)) using (ManualResetEvent release = new ManualResetEvent(false)) using (ManualResetEvent replaced = new ManualResetEvent(false))
+                {
+                    Thread sender = new Thread(delegate() { admission.TrySend(captured, delegate { entered.Set(); release.WaitOne(); }); });
+                    Thread replacement = new Thread(delegate() { next = admission.StartPaused(h.Session); replaced.Set(); });
+                    sender.Start(); Require(entered.WaitOne(2000), "Sender did not enter gate."); replacement.Start();
+                    try
+                    {
+                        Require(SpinWait.SpinUntil(delegate { return !object.ReferenceEquals(admission.Capture(), captured); }, 1000), "Replacement did not invalidate old admission.");
+                        Require(!replaced.WaitOne(0), "Replacement overtook an old final send.");
+                    }
+                    finally { release.Set(); Require(sender.Join(2000) && replacement.Join(2000), "Replacement workers blocked."); }
+                    Require(next != token && !admission.IsCurrent(captured) && !admission.Resume(73, token) && admission.Resume(73, next), "Replacement lost the exact new ticket gate.");
+                }
+            });
+            test("slow final send does not serialize other current responses", delegate
+            {
+                Harness h = new Harness(); DualDnsAdmission admission = new DualDnsAdmission(); long token = admission.StartPaused(h.Session);
+                Require(admission.Resume(73, token), "Fixture activation failed."); DualDnsAdmission.State captured = admission.Capture(); int completed = 0;
+                using (ManualResetEvent entered = new ManualResetEvent(false)) using (ManualResetEvent release = new ManualResetEvent(false))
+                {
+                    Thread slow = new Thread(delegate() { admission.TrySend(captured, delegate { entered.Set(); release.WaitOne(); }); });
+                    slow.Start(); Require(entered.WaitOne(2000), "Slow sender did not enter.");
+                    try
+                    {
+                        Stopwatch timer = Stopwatch.StartNew();
+                        for (int i = 0; i < 16; i++) Require(admission.TrySend(captured, delegate { completed++; }), "Current response dropped behind another sender.");
+                        Require(completed == 16 && timer.ElapsedMilliseconds < 1000, "Current responses waited for slow output.");
+                    }
+                    finally { release.Set(); Require(slow.Join(2000), "Slow sender did not finish."); }
+                }
+            });
+            test("Pause during StartPaused drain cancels that pending ticket without resurrection", delegate
+            {
+                Harness h = new Harness(); DualDnsAdmission admission = new DualDnsAdmission(); long token = admission.StartPaused(h.Session);
+                Require(admission.Resume(73, token), "Fixture activation failed."); DualDnsAdmission.State captured = admission.Capture(); Exception cancelled = null;
+                using (ManualResetEvent entered = new ManualResetEvent(false)) using (ManualResetEvent release = new ManualResetEvent(false))
+                {
+                    Thread sender = new Thread(delegate() { admission.TrySend(captured, delegate { entered.Set(); release.WaitOne(); }); });
+                    Thread replacement = new Thread(delegate() { try { admission.StartPaused(h.Session); } catch (Exception e) { cancelled = e; } });
+                    Thread pauser = new Thread(delegate() { admission.Pause(); });
+                    sender.Start(); Require(entered.WaitOne(2000), "Sender did not enter."); replacement.Start();
+                    try
+                    {
+                        Require(SpinWait.SpinUntil(delegate { return !object.ReferenceEquals(admission.Capture(), captured); }, 1000), "Replacement did not publish pending ticket.");
+                        pauser.Start(); Require(SpinWait.SpinUntil(delegate { return admission.Capture() == null; }, 1000), "Pause did not cancel pending ticket.");
+                    }
+                    finally
+                    {
+                        release.Set(); Require(sender.Join(2000) && replacement.Join(2000), "Cancelled replacement blocked.");
+                        if (pauser.ThreadState != System.Threading.ThreadState.Unstarted) Require(pauser.Join(2000), "Pauser blocked.");
+                    }
+                    Require(cancelled is InvalidOperationException && admission.Capture() == null && !admission.Resume(73, token), "In-flight StartPaused resurrected after Pause.");
+                }
+            });
             test("A route batch before response with epoch and TTL cap", delegate
             {
                 Harness h = new Harness(); byte[] q = Query(); byte[] reply = h.Handle(q);
@@ -275,7 +469,41 @@ namespace FastLinkDirectTool.Tests
                 foreach (ushort type in new ushort[] { 28, 64, 65 }) foreach (string host in new[] { CompanyHost, "public.example.test" })
                 { Harness h = new Harness(); byte[] reply = h.Handle(Query(host, type)); Require(Rcode(reply) == 0 && h.Routes == 0 && h.Transport.Calls.Count == 0 && DualDnsPacket.U16(reply, 6) == 0, "IPv6/service-binding query leaked."); }
             });
-            test("unsupported SRV TXT CNAME ANY never forwarded", delegate
+            test("corporate SRV returns only same-role names and keeps subsequent A lookup gated", delegate
+            {
+                Harness h = new Harness(); string locator = "_ldap._tcp.dc._msdcs.corp.example.test", dc = "dc1.corp.example.test";
+                h.Transport.Handler = delegate(byte[] q, Call c) { return Answer(q, new[] { Service(locator, dc), Service("other.corp.example.test", "other.invalid") }, new[] { A(dc, "10.20.30.40") }); };
+                byte[] query = Query(locator, 33), reply = h.Handle(query);
+                DualDnsRecord r = DualDnsPacket.ReadAnswer(reply, DualDnsPacket.ReadQuery(query)).Records.Single();
+                Require(Rcode(reply) == 0 && r.ServiceHost == dc && r.Priority == 10 && r.Weight == 20 && r.Port == 389 && r.Ttl == 60, "Wrong SRV answer.");
+                Require(h.Routes == 0 && h.Transport.Calls.Single().Source == "192.0.2.20" && DualDnsPacket.U16(reply, 10) == 0, "SRV leaked glue or used wrong NIC.");
+                h.Transport.Handler = delegate(byte[] q, Call c) { return Answer(q, new[] { A(dc, "10.20.30.40") }); };
+                Require(Rcode(h.Handle(Query(dc))) == 0 && h.Routes == 1 && h.Target == RuleTarget.Corporate, "DC lookup missed route gate.");
+            });
+            test("SRV rejects foreign discovery and targets and strips unrelated records", delegate
+            {
+                string locator = "_ldap._tcp.corp.example.test";
+                Harness h = new Harness(); Rejected(h, Query("_ldap._tcp.external.example", 33), 5);
+                Require(h.Transport.Calls.Count == 0, "Foreign SRV query leaked.");
+                foreach (string target in new[] { "other.invalid", "127.0.0.1" })
+                {
+                    h.Transport.Handler = delegate(byte[] q, Call c) { return Answer(q, new[] { Service(locator, target) }); };
+                    Rejected(h, Query(locator, 33));
+                }
+                h.Transport.Handler = delegate(byte[] q, Call c) { return Answer(q, new[] { Service(locator, "") }); };
+                byte[] query = Query(locator, 33);
+                Require(DualDnsPacket.ReadAnswer(h.Handle(query), DualDnsPacket.ReadQuery(query)).Records.Single().ServiceHost == "", "Unavailable service misparsed.");
+            });
+            test("SRV retries over TCP for large responses", delegate
+            {
+                string locator = "_ldap._tcp.dc._msdcs.corp.example.test";
+                Harness h = new Harness();
+                h.Transport.Handler = delegate(byte[] q, Call c) { return Answer(q, Enumerable.Range(0, 18).Select(i => Service(locator, "server" + i + ".corp.example.test"))); };
+                byte[] query = Query(locator, 33);
+                Require(DualDnsPacket.CheckEnvelope(h.Handle(query), DualDnsPacket.ReadQuery(query)), "Oversized UDP answer was not truncated.");
+                Require(DualDnsPacket.ReadAnswer(h.Handle(query, true), DualDnsPacket.ReadQuery(query)).Records.Count == 18, "TCP did not return complete SRV set.");
+            });
+            test("ordinary host SRV and unsupported record types never forwarded", delegate
             {
                 foreach (ushort type in new ushort[] { 33, 16, 5, 255, 2 }) { Harness h = new Harness(); Rejected(h, Query(CompanyHost, type), 5); Require(h.Transport.Calls.Count == 0, "Unsupported type forwarded."); }
             });

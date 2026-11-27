@@ -212,7 +212,9 @@ namespace FastLinkDirectTool.Modes
                 if (!trayTransitioning && WindowState == FormWindowState.Minimized) MinimizeToTray();
             };
             timer.Interval = 10000;
-            timer.Tick += delegate { if (working) UpdateStatusSummary(); else RefreshReadOnly(); };
+            // Keep a failed click's actual reason visible until a user retries
+            // or requests a status check. The paused session has no polling work.
+            timer.Tick += delegate { if (working) UpdateStatusSummary(); else if (!automaticChecksPaused) RefreshReadOnly(); };
             Shown += delegate
             {
                 // Toggling taskbar visibility may recreate the native handle.
